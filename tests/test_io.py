@@ -51,7 +51,7 @@ class IOHelpersTests(unittest.TestCase):
         adata = self._make_adata()
         adata.write_h5ad(source)
 
-        annotations = sct.read_everything_but_X(source)
+        annotations = sct.io.read_everything_but_X(source)
 
         self.assertEqual(annotations.shape, adata.shape)
         self.assertListEqual(annotations.obs_names.tolist(), adata.obs_names.tolist())
@@ -64,7 +64,7 @@ class IOHelpersTests(unittest.TestCase):
         adata = self._make_adata(matrix_format="csc")
         adata.write_h5ad(source)
 
-        sct.csc2csr_on_disk(source, output)
+        sct.io.csc2csr_on_disk(source, output)
 
         with h5py.File(output, "r") as handle:
             self.assertEqual(_encoding_type(handle["X"]), "csr_matrix")
@@ -85,7 +85,7 @@ class IOHelpersTests(unittest.TestCase):
         adata1.write_h5ad(first)
         adata2.write_h5ad(second)
 
-        sct.concat_on_disk([first, second], output, temp_pth=temp)
+        sct.io.concat_on_disk([first, second], output, temp_pth=temp)
 
         merged = ad.read_h5ad(output)
         expected = np.vstack([adata1.X.toarray(), adata2.X.toarray()])
@@ -99,10 +99,10 @@ class IOHelpersTests(unittest.TestCase):
         adata = self._make_adata()
         adata.write_h5ad(source)
 
-        annotations = sct.read_everything_but_X(source)
+        annotations = sct.io.read_everything_but_X(source)
         annotations.obs["sample"] = ["s1", "s2", "s3"]
 
-        sct.write_h5ad_with_new_annotation(source, annotations, output, raw=True)
+        sct.io.write_h5ad_with_new_annotation(source, annotations, output, raw=True)
 
         restored = ad.read_h5ad(output)
         self.assertIn("sample", restored.obs.columns)
@@ -118,7 +118,7 @@ class IOHelpersTests(unittest.TestCase):
         subset_obs = np.array([True, False, True])
         subset_var = np.array([True, False, True])
 
-        sct.ondisk_subset(source, output, subset_obs=subset_obs, subset_var=subset_var, raw=True)
+        sct.io.ondisk_subset(source, output, subset_obs=subset_obs, subset_var=subset_var, raw=True)
 
         restored = ad.read_h5ad(output)
         np.testing.assert_array_equal(
@@ -130,6 +130,12 @@ class IOHelpersTests(unittest.TestCase):
             adata.raw.X.toarray()[subset_obs][:, subset_var],
         )
         self.assertListEqual(restored.var_names.tolist(), ["g1", "g3"])
+
+    def test_namespace_modules_are_exposed(self):
+        self.assertIs(sct.io.read_everything_but_X, sct.read_everything_but_X)
+        self.assertTrue(hasattr(sct, "pl"))
+        self.assertTrue(hasattr(sct, "pp"))
+        self.assertTrue(hasattr(sct, "tl"))
 
 
 if __name__ == "__main__":

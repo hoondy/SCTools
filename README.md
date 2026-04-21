@@ -2,12 +2,19 @@
 
 `SCTools` packages a collection of Pegasus/Scanpy helper functions from `pge.py` into an installable Python library.
 
+The project now groups helpers into the following namespaces:
+
+- `sct.io` for AnnData/H5AD read-write helpers
+- `sct.pl` for plotting helpers
+- `sct.pp` for preprocessing helpers
+- `sct.tl` for analysis and tool helpers
+
 The project keeps lightweight AnnData/H5AD utilities available from a simple import:
 
 ```python
 import SCTools as sct
 
-adata = sct.read_everything_but_X("/path/to/file.h5ad")
+adata = sct.io.read_everything_but_X("/path/to/file.h5ad")
 ```
 
 ## Installation
@@ -28,10 +35,12 @@ pip install pegasuspy scanpy scikit-learn seaborn matplotlib adjustText numpy-gr
 
 `SCTools` currently bundles:
 
-- On-disk AnnData/H5AD helpers such as `read_everything_but_X`, `csc2csr_on_disk`, `concat_on_disk`, `ondisk_subset`, and `write_h5ad_with_new_annotation`
-- Pegasus/Scanpy analysis helpers including HVG selection, PCA, pseudobulk aggregation, signature scoring, and plotting utilities
-- Cluster comparison helpers such as cosine similarity, L2 distance, Pearson correlation, and Spearman correlation
-- Visualization helpers including a Sankey diagram generator and correlation plots
+- `sct.io`: `read_everything_but_X`, `csc2csr_on_disk`, `concat_on_disk`, `ondisk_subset`, `write_h5ad_with_new_annotation`, `proc_h5ad_v2`, `proc_h5ad_v3`, `proc_manifest`, and `save`
+- `sct.pp`: preprocessing helpers such as HVG selection, PCA, QC boundaries, signature scores, and category cleanup
+- `sct.tl`: aggregation, similarity, marker, PLS, and pseudometacell helpers
+- `sct.pl`: scree plots, correlation plots, palettes, and Sankey diagrams
+
+For backward compatibility, the original top-level function names are still available too.
 
 ## Audit and fixes applied
 
