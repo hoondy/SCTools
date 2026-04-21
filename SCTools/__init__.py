@@ -1,16 +1,10 @@
 """Public package interface for SCTools."""
 
-import pge as _core
-
 from . import io, pl, pp, tl
 from ._version import __version__
+from .io import *  # noqa: F401,F403
+from .pl import *  # noqa: F401,F403
+from .pp import *  # noqa: F401,F403
+from .tl import *  # noqa: F401,F403
 
-_top_level_exports = [
-    name
-    for name, obj in vars(_core).items()
-    if not name.startswith("_") and getattr(obj, "__module__", None) == _core.__name__
-]
-
-__all__ = ["__version__", "io", "pl", "pp", "tl", *_top_level_exports]
-
-globals().update({name: getattr(_core, name) for name in _top_level_exports})
+__all__ = ["__version__", "io", "pl", "pp", "tl", *io.__all__, *pl.__all__, *pp.__all__, *tl.__all__]

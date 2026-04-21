@@ -6,6 +6,7 @@ import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
+import pge
 from scipy import sparse
 
 import SCTools as sct
@@ -136,6 +137,12 @@ class IOHelpersTests(unittest.TestCase):
         self.assertTrue(hasattr(sct, "pl"))
         self.assertTrue(hasattr(sct, "pp"))
         self.assertTrue(hasattr(sct, "tl"))
+
+    def test_pge_compatibility_shim_reexports_same_functions(self):
+        self.assertIs(pge.read_everything_but_X, sct.io.read_everything_but_X)
+        self.assertIs(pge.scanpy_hvf, sct.pp.scanpy_hvf)
+        self.assertIs(pge.corrMat, sct.tl.corrMat)
+        self.assertIs(pge.sankey, sct.pl.sankey)
 
 
 if __name__ == "__main__":
