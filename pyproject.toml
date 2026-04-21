@@ -44,4 +44,3 @@ analysis = [
 
 [tool.setuptools]
 packages = ["SCTools"]
-py-modules = ["pge"]

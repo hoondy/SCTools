@@ -1,8 +1,8 @@
 # SCTools
 
-`SCTools` packages a collection of Pegasus/Scanpy helper functions from `pge.py` into an installable Python library.
+`SCTools` packages a collection of Pegasus/Scanpy helper functions into an installable Python library.
 
-The project now groups helpers into the following namespaces:
+The project groups helpers into the following namespaces:
 
 - `sct.io` for AnnData/H5AD read-write helpers
 - `sct.pl` for plotting helpers
@@ -40,7 +40,7 @@ pip install pegasuspy scanpy scikit-learn seaborn matplotlib adjustText numpy-gr
 - `sct.tl`: aggregation, similarity, marker, PLS, and pseudometacell helpers
 - `sct.pl`: scree plots, correlation plots, palettes, and Sankey diagrams
 
-For backward compatibility, the original top-level function names are still available too.
+Functions are intentionally namespaced. Use `sct.io.read_everything_but_X(...)` rather than `sct.read_everything_but_X(...)`.
 
 ## Audit and fixes applied
 
