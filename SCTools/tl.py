@@ -2,6 +2,7 @@
 
 from ._shared import (
     _get_sample_size,
+    _require_group_kfold,
     _require_numpy_groupies,
     _require_pairwise_metrics,
     _require_pegasus,
@@ -13,6 +14,7 @@ from ._shared import (
     logger,
     np,
     pd,
+    sparse,
     stats,
     time,
 )
@@ -292,35 +294,263 @@ def pls(
     standardize: bool = True,
     max_value: float = 10,
 ) -> None:
-    """Perform PLS regression on the data."""
+    """Perform PLS regression on the data.
+
+    Stores the cell embedding in ``data.obsm["X_pls"]`` and the gene-space
+    loadings / weights in ``data.uns["PLS_x_loadings"]`` /
+    ``data.uns["PLS_x_weights"]``. The input HVG matrix in
+    ``data.uns[<features>]`` is not modified.
+    """
     pg = _require_pegasus()
     PLSRegression = _require_pls_regression()
 
+    if y not in data.obs.columns:
+        raise KeyError(f"`y`={y!r} not in data.obs.")
+    y_vec = pd.to_numeric(data.obs[y], errors="coerce").to_numpy(dtype=np.float64)
+    if not np.isfinite(y_vec).all():
+        raise ValueError(
+            f"`data.obs[{y!r}]` must be numeric and finite; "
+            "drop or impute NaN / non-numeric values before calling `pls`."
+        )
+
     keyword = pg.select_features(data, features)
     start = time.perf_counter()
+
     X = data.uns[keyword]
-    assert y in data.obs
+    if sparse.issparse(X):
+        X = X.toarray()
+    X = np.array(X, dtype=np.float64, copy=True)  # never mutate data.uns[keyword]
 
     if standardize:
         m1 = X.mean(axis=0)
-        psum = np.multiply(X, X).sum(axis=0)
-        std = ((psum - X.shape[0] * (m1 ** 2)) / (X.shape[0] - 1.0)) ** 0.5
-        std[std == 0] = 1
+        std = X.std(axis=0, ddof=1)
+        std[std == 0] = 1.0
         X -= m1
         X /= std
 
     if max_value is not None:
-        X[X > max_value] = max_value
-        X[X < -max_value] = -max_value
+        np.clip(X, -max_value, max_value, out=X)
 
-    pls = PLSRegression(n_components=n_components)
-    X_pls = pls.fit_transform(X, data.obs[y].values)[0]
+    model = PLSRegression(n_components=n_components)
+    X_pls = model.fit_transform(X, y_vec)[0]
 
     data.obsm["X_pls"] = X_pls
-    data.uns["PLS_x_loadings"] = pls.x_loadings_
+    data.uns["PLS_x_loadings"] = model.x_loadings_
+    data.uns["PLS_x_weights"] = model.x_weights_
 
     end = time.perf_counter()
     logger.info("PLS is done. Time spent = {:.2f}s.".format(end - start))
+
+
+def _standardize_columns(X, max_value=None):
+    """Column-standardize a dense ndarray in place on a copy; optional symmetric clip."""
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    mean = X.mean(axis=0)
+    std = X.std(axis=0, ddof=1)
+    std[std == 0] = 1.0
+    X -= mean
+    X /= std
+    if max_value is not None:
+        np.clip(X, -max_value, max_value, out=X)
+    return X, mean, std
+
+
+def _residualize(X, C):
+    """Return X residualized on covariate matrix C (with intercept). Fits OLS column-wise."""
+    C = np.asarray(C, dtype=np.float64)
+    if C.ndim == 1:
+        C = C.reshape(-1, 1)
+    C = np.hstack([np.ones((C.shape[0], 1)), C])
+    beta, *_ = np.linalg.lstsq(C, X, rcond=None)
+    return X - C @ beta, beta
+
+
+def _build_covariates(obs, covariates):
+    """Turn a list of .obs column names into a numeric design matrix (one-hot for categoricals)."""
+    if covariates is None or len(covariates) == 0:
+        return None
+    frame = obs.loc[:, list(covariates)].copy()
+    return pd.get_dummies(frame, drop_first=True, dummy_na=False).to_numpy(dtype=np.float64)
+
+
+def pls_score(
+    data: ad.AnnData,
+    y: str,
+    donor_key: str,
+    features: str = "highly_variable_features",
+    n_components: int = 2,
+    n_splits: int = 5,
+    standardize: bool = True,
+    max_value: float = 10.0,
+    covariates=None,
+    score_key: str = "pls_disease_score",
+    oof_components_key: str = "X_pls_oof",
+    loadings_key: str = "PLS_x_loadings_full",
+    weights_key: str = "PLS_x_weights_full",
+    n_permutations: int = 0,
+    random_state: int = 0,
+) -> dict:
+    """Per-cell disease pseudotime via donor-grouped PLS with out-of-fold scoring.
+
+    Intended to be run on an already-subsetted AnnData (e.g. one cell type). `y` is
+    a donor-level quantitative phenotype (Braak, CERAD, PRS, continuous biomarker).
+    Returns a dict of diagnostics; writes:
+      - data.obs[score_key]              cell score in [0, 1] (rank of PLS1, NaN if excluded)
+      - data.obsm[oof_components_key]    (n_cells, n_components) out-of-fold components
+      - data.uns[loadings_key]           gene loadings from the full-data fit
+      - data.uns[weights_key]            x_weights_ from the full-data fit (for projection)
+    """
+    PLSRegression = _require_pls_regression()
+    GroupKFold = _require_group_kfold()
+    pg = _require_pegasus()
+
+    if y not in data.obs.columns:
+        raise KeyError(f"`y`={y!r} not in data.obs.")
+    if donor_key not in data.obs.columns:
+        raise KeyError(f"`donor_key`={donor_key!r} not in data.obs.")
+
+    keyword = pg.select_features(data, features)
+    X_full = data.uns[keyword]
+    if sparse.issparse(X_full):
+        X_full = X_full.toarray()
+    X_full = np.array(X_full, dtype=np.float64, copy=True)  # hard copy; never mutate .uns
+
+    y_vec = pd.to_numeric(data.obs[y], errors="coerce").to_numpy()
+    donors = data.obs[donor_key].astype(str).to_numpy()
+    C_full = _build_covariates(data.obs, covariates)
+
+    valid = np.isfinite(y_vec) & (donors != "nan")
+    if valid.sum() < 2:
+        raise ValueError("Not enough cells with finite `y` and valid `donor_key`.")
+
+    unique_donors = pd.unique(donors[valid])
+    if len(unique_donors) < n_splits:
+        raise ValueError(
+            f"n_splits={n_splits} but only {len(unique_donors)} donors with valid `y`. "
+            "Lower `n_splits` or check inputs."
+        )
+    # Warn if y has no within-donor variance (the usual case for Braak etc.)
+    dvals = pd.DataFrame({"d": donors[valid], "y": y_vec[valid]}).groupby("d")["y"].nunique()
+    if (dvals > 1).any():
+        logger.info("`y` varies within donor for some donors; using cell-level values as given.")
+
+    start = time.perf_counter()
+
+    # Standardize (on the *valid* subset to avoid NaN-contaminated stats).
+    if standardize:
+        X_valid, mean_, std_ = _standardize_columns(X_full[valid], max_value=max_value)
+    else:
+        X_valid = X_full[valid].copy()
+        mean_, std_ = np.zeros(X_full.shape[1]), np.ones(X_full.shape[1])
+        if max_value is not None:
+            np.clip(X_valid, -max_value, max_value, out=X_valid)
+
+    y_valid = y_vec[valid].astype(np.float64)
+    donors_valid = donors[valid]
+    C_valid = C_full[valid] if C_full is not None else None
+
+    # ---- Donor-grouped out-of-fold PLS ----
+    oof = np.full((X_valid.shape[0], n_components), np.nan, dtype=np.float64)
+    rng = np.random.default_rng(random_state)
+    # GroupKFold is deterministic; we shuffle donor order for stability across runs.
+    order = rng.permutation(np.arange(X_valid.shape[0]))
+    inv_order = np.argsort(order)
+    X_ord = X_valid[order]
+    y_ord = y_valid[order]
+    g_ord = donors_valid[order]
+    C_ord = C_valid[order] if C_valid is not None else None
+
+    gkf = GroupKFold(n_splits=n_splits)
+    for fold, (tr, te) in enumerate(gkf.split(X_ord, y_ord, groups=g_ord)):
+        X_tr, X_te = X_ord[tr].copy(), X_ord[te].copy()
+        if C_ord is not None:
+            X_tr, beta = _residualize(X_tr, C_ord[tr])
+            C_te_aug = np.hstack([np.ones((te.size, 1)), C_ord[te]])
+            X_te = X_te - C_te_aug @ beta
+        model = PLSRegression(n_components=n_components, scale=False)
+        model.fit(X_tr, y_ord[tr])
+        oof[te] = model.transform(X_te)
+
+    oof = oof[inv_order]  # undo shuffle
+
+    # ---- Final full-data model for stable loadings/weights ----
+    X_fit = X_valid.copy()
+    if C_valid is not None:
+        X_fit, _ = _residualize(X_fit, C_valid)
+    full_model = PLSRegression(n_components=n_components, scale=False)
+    full_model.fit(X_fit, y_valid)
+
+    # ---- Orient PLS1 so higher = higher y ----
+    r1, _ = stats.pearsonr(oof[:, 0], y_valid)
+    if r1 < 0:
+        oof[:, 0] *= -1.0
+        r1 = -r1
+
+    # ---- Sanity diagnostics ----
+    df_score = pd.DataFrame({"d": donors_valid, "s": oof[:, 0]})
+    grand_mean = df_score["s"].mean()
+    between = df_score.groupby("d")["s"].mean().var(ddof=1)
+    within = df_score.groupby("d")["s"].var(ddof=1).mean()
+    total = df_score["s"].var(ddof=1)
+    between_frac = float(between / total) if total > 0 else float("nan")
+
+    perm_p = None
+    if n_permutations and n_permutations > 0:
+        donor_y = (
+            pd.DataFrame({"d": donors_valid, "y": y_valid})
+            .drop_duplicates("d")
+            .set_index("d")["y"]
+        )
+        null_r = np.empty(n_permutations)
+        for i in range(n_permutations):
+            shuffled_map = dict(zip(donor_y.index, rng.permutation(donor_y.values)))
+            y_shuf = np.array([shuffled_map[d] for d in donors_valid])
+            m = PLSRegression(n_components=1, scale=False)
+            m.fit(X_fit, y_shuf)
+            s = m.transform(X_fit)[:, 0]
+            null_r[i] = abs(stats.pearsonr(s, y_shuf)[0])
+        perm_p = float((np.sum(null_r >= abs(r1)) + 1) / (n_permutations + 1))
+
+    # ---- Write outputs ----
+    full_oof = np.full((data.n_obs, n_components), np.nan, dtype=np.float64)
+    full_oof[valid] = oof
+    data.obsm[oof_components_key] = full_oof
+
+    # Rank-transform PLS1 to [0,1] over valid cells; invalid -> NaN.
+    score = np.full(data.n_obs, np.nan, dtype=np.float64)
+    r = stats.rankdata(oof[:, 0], method="average")
+    score[valid] = (r - 1) / max(len(r) - 1, 1)
+    data.obs[score_key] = score
+
+    data.uns[loadings_key] = full_model.x_loadings_
+    data.uns[weights_key] = full_model.x_weights_
+
+    diagnostics = {
+        "pearson_r_pls1_y": float(r1),
+        "between_donor_variance_fraction": between_frac,
+        "n_cells_scored": int(valid.sum()),
+        "n_donors": int(len(unique_donors)),
+        "n_components": int(n_components),
+        "n_splits": int(n_splits),
+        "permutation_p": perm_p,
+    }
+    logger.info(
+        "pls_score: r(PLS1,y)={:.3f}  between-donor var frac={:.2f}  "
+        "cells={}  donors={}  time={:.2f}s".format(
+            diagnostics["pearson_r_pls1_y"],
+            diagnostics["between_donor_variance_fraction"],
+            diagnostics["n_cells_scored"],
+            diagnostics["n_donors"],
+            time.perf_counter() - start,
+        )
+    )
+    if between_frac > 0.8:
+        logger.warning(
+            "pls_score: >80%% of PLS1 variance is between-donor (%.2f). "
+            "Treat this as a donor discriminator, not a disease axis.",
+            between_frac,
+        )
+    return diagnostics
 
 
 __all__ = [
@@ -333,6 +563,7 @@ __all__ = [
     "pb_agg_by_cluster",
     "pearson_corr",
     "pls",
+    "pls_score",
     "pseudoMetaCellByGroup",
     "spearman_corr",
 ]

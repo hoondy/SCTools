@@ -55,6 +55,119 @@ This packaging pass also fixed several portability and correctness issues from t
 - `sankey` now handles single-label inputs without referencing an undefined `topEdge`
 - `mark_MitoCarta` now accepts an explicit reference path instead of depending on one hard-coded filesystem location
 
+## PLS: supervised embedding and per-cell disease score
+
+`sct.tl.pls` and `sct.tl.pls_score` provide a **complementary supervised
+embedding** to the standard HVG → PCA → UMAP workflow. They are not a drop-in
+replacement for PCA.
+
+### How PLS differs from PCA
+
+- **PCA** finds directions that maximize variance in the gene expression
+  matrix `X` — it is fully unsupervised. In scRNA-seq the leading PCs are
+  dominated by whatever drives the most variance: cell type identity, cell
+  cycle, library size, batch. Subtle disease effects often live in PCs 20–50
+  or are smeared across many components.
+- **PLS** finds directions in `X` that maximize **covariance** with a response
+  `Y` — it is supervised. By construction the first few PLS components are the
+  directions in gene space most aligned with `Y`. That is exactly what you want
+  when the goal is to see the disease axis, and exactly what you don't want if
+  the goal is an unbiased representation of cellular heterogeneity.
+
+Cluster and annotate cell types on a PCA embedding, then apply PLS **within a
+cell type** to recover the disease axis. Treat PLS output as a focused
+analysis tool, not as the general embedding used for clustering.
+
+### `sct.tl.pls` — supervised embedding
+
+Fits PLS on the full dataset and stores a per-cell embedding for downstream
+visualization / neighbor-graph construction alongside (not instead of) PCA.
+
+```python
+import SCTools as sct
+
+sct.tl.pls(
+    adata,
+    y="Braak",                       # numeric phenotype in adata.obs
+    n_components=50,
+    features="highly_variable_features",
+)
+# adata.obsm["X_pls"]          -> (n_cells, n_components) embedding
+# adata.uns["PLS_x_loadings"]  -> gene loadings from the fit
+# adata.uns["PLS_x_weights"]   -> gene weights (use these to project new data)
+```
+
+Notes:
+
+- `y` must be numeric and finite in every cell; categorical labels should be
+  coerced to a numeric score first.
+- The HVG matrix in `adata.uns[<features>]` is read but not modified.
+- This is an **in-sample** fit. Do not use the resulting scores as a test of
+  disease separation on the same cells — use `sct.tl.pls_score` for that.
+
+### `sct.tl.pls_score` — per-cell disease pseudotime
+
+Produces a per-cell score in `[0, 1]` suitable for visualization on UMAP and
+for downstream trajectory / niche analyses. Addresses the main failure modes
+of naive PLS:
+
+- **Donor-grouped cross-validation.** Each cell's score is an *out-of-fold*
+  PLS score — the model that produced it was fit on donors that did not
+  include that cell's donor. Without this, PLS preferentially learns a donor
+  discriminator (ambient RNA, PMI, dissociation, sex, age), not a disease
+  axis.
+- **Optional covariate residualization** (e.g. `pct_mito`, `log_counts`,
+  `sex`, `age`) fit per training fold to avoid leakage.
+- **Sign-oriented** so higher score means higher `y`, then **rank-transformed
+  to [0, 1]** to give a proper pseudotime-like readout.
+- **Diagnostics** printed and returned: Pearson r(PLS1, y), between-donor
+  variance fraction (warns above 0.8 — your PLS1 is then mostly a donor
+  discriminator), and an optional permutation-null p-value.
+
+Typical usage, one cell type at a time:
+
+```python
+mg = adata[adata.obs["celltype"] == "Microglia"].copy()
+
+diag = sct.tl.pls_score(
+    mg,
+    y="Braak",                     # donor-level quantitative phenotype
+    donor_key="donor_id",          # grouping variable for CV
+    covariates=["pct_mito", "log_counts", "sex", "age"],
+    n_components=2,
+    n_splits=5,
+    n_permutations=200,
+)
+
+# mg.obs["pls_disease_score"]       -> per-cell score in [0, 1]
+# mg.obsm["X_pls_oof"]              -> out-of-fold PLS components
+# mg.uns["PLS_x_loadings_full"]     -> loadings from full-data fit
+# mg.uns["PLS_x_weights_full"]      -> weights from full-data fit
+
+import scanpy as sc
+sc.pl.umap(mg, color="pls_disease_score", cmap="magma")
+```
+
+### Caveats worth repeating
+
+- PLS is supervised. Any reported separation between cases and controls along
+  `X_pls` computed in-sample is partly circular. Use `sct.tl.pls_score` and
+  its out-of-fold scores when you need to quantify separation.
+- In typical case/control scRNA-seq designs the label is attached to the
+  **donor**, not the cell. With few donors, the first PLS axis can be largely
+  a donor-batch axis. Inspect the `between_donor_variance_fraction`
+  diagnostic from `pls_score` — values above ~0.8 indicate a donor
+  discriminator rather than a disease axis.
+- Apply PLS **within a single cell type** after annotation. Fitting across
+  cell types invites the PLS direction to capture cell-type × disease
+  interactions that are hard to interpret.
+- PLS is linear. Thresholded / combinatorial disease effects may only appear
+  as a linear shadow. Non-linear supervised models (MRVI, contrastive VAEs)
+  are alternatives when that matters.
+- Treat the PLS axis as a **hypothesis generator**. Validate the resulting
+  gene signature on independent data (other cohorts, bulk RNA-seq, spatial)
+  before drawing biological conclusions.
+
 ## Notes
 
 - `read_everything_but_X` is designed for annotation-only access. It reconstructs an `AnnData` object from everything except `X` and `raw/X`.
