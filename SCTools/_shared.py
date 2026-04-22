@@ -87,6 +87,10 @@ def _require_pls_regression():
     return _require_optional_dependency("sklearn.cross_decomposition", "scikit-learn").PLSRegression
 
 
+def _require_group_kfold():
+    return _require_optional_dependency("sklearn.model_selection", "scikit-learn").GroupKFold
+
+
 def _require_numpy_groupies():
     return _require_optional_dependency("numpy_groupies")
 
