@@ -331,7 +331,7 @@ def pls(
     if max_value is not None:
         np.clip(X, -max_value, max_value, out=X)
 
-    model = PLSRegression(n_components=n_components)
+    model = PLSRegression(n_components=n_components, scale=False)
     X_pls = model.fit_transform(X, y_vec)[0]
 
     data.obsm["X_pls"] = X_pls
@@ -342,17 +342,22 @@ def pls(
     logger.info("PLS is done. Time spent = {:.2f}s.".format(end - start))
 
 
-def _standardize_columns(X, max_value=None):
-    """Column-standardize a dense ndarray in place on a copy; optional symmetric clip."""
-    X = np.ascontiguousarray(X, dtype=np.float64)
-    mean = X.mean(axis=0)
-    std = X.std(axis=0, ddof=1)
-    std[std == 0] = 1.0
+def _apply_standardize(X, mean, std, max_value):
+    """Apply precomputed column mean/std (in place on a fresh copy) and optional clip."""
+    X = np.array(X, dtype=np.float64, copy=True)
     X -= mean
     X /= std
     if max_value is not None:
         np.clip(X, -max_value, max_value, out=X)
-    return X, mean, std
+    return X
+
+
+def _fit_standardize(X):
+    """Compute column mean and std (ddof=1) from X; guard zero-variance columns."""
+    mean = X.mean(axis=0)
+    std = X.std(axis=0, ddof=1)
+    std[std == 0] = 1.0
+    return mean, std
 
 
 def _residualize(X, C):
@@ -371,6 +376,58 @@ def _build_covariates(obs, covariates):
         return None
     frame = obs.loc[:, list(covariates)].copy()
     return pd.get_dummies(frame, drop_first=True, dummy_na=False).to_numpy(dtype=np.float64)
+
+
+def _oof_pls(
+    X_valid,
+    y_valid,
+    donors_valid,
+    C_valid,
+    n_components,
+    n_splits,
+    standardize,
+    max_value,
+    rng,
+):
+    """Donor-grouped out-of-fold PLS scores.
+
+    Standardization (if enabled) and covariate residualization are both refit on
+    each training fold, so no information from the held-out donors leaks into the
+    scaling parameters or the covariate betas used to score them.
+    """
+    PLSRegression = _require_pls_regression()
+    GroupKFold = _require_group_kfold()
+
+    n = X_valid.shape[0]
+    oof = np.full((n, n_components), np.nan, dtype=np.float64)
+    order = rng.permutation(n)
+    inv_order = np.argsort(order)
+    X_ord = X_valid[order]
+    y_ord = y_valid[order]
+    g_ord = donors_valid[order]
+    C_ord = C_valid[order] if C_valid is not None else None
+
+    for tr, te in GroupKFold(n_splits=n_splits).split(X_ord, y_ord, groups=g_ord):
+        X_tr = np.array(X_ord[tr], dtype=np.float64, copy=True)
+        X_te = np.array(X_ord[te], dtype=np.float64, copy=True)
+        if standardize:
+            mean_tr, std_tr = _fit_standardize(X_tr)
+            X_tr -= mean_tr
+            X_tr /= std_tr
+            X_te -= mean_tr
+            X_te /= std_tr
+        if max_value is not None:
+            np.clip(X_tr, -max_value, max_value, out=X_tr)
+            np.clip(X_te, -max_value, max_value, out=X_te)
+        if C_ord is not None:
+            X_tr, beta = _residualize(X_tr, C_ord[tr])
+            C_te_aug = np.hstack([np.ones((te.size, 1)), C_ord[te]])
+            X_te = X_te - C_te_aug @ beta
+        model = PLSRegression(n_components=n_components, scale=False)
+        model.fit(X_tr, y_ord[tr])
+        oof[te] = model.transform(X_te)
+
+    return oof[inv_order]
 
 
 def pls_score(
@@ -401,7 +458,7 @@ def pls_score(
       - data.uns[weights_key]            x_weights_ from the full-data fit (for projection)
     """
     PLSRegression = _require_pls_regression()
-    GroupKFold = _require_group_kfold()
+    _require_group_kfold()  # fail fast if sklearn is missing
     pg = _require_pegasus()
 
     if y not in data.obs.columns:
@@ -416,10 +473,11 @@ def pls_score(
     X_full = np.array(X_full, dtype=np.float64, copy=True)  # hard copy; never mutate .uns
 
     y_vec = pd.to_numeric(data.obs[y], errors="coerce").to_numpy()
+    donor_missing = pd.isna(data.obs[donor_key]).to_numpy()
     donors = data.obs[donor_key].astype(str).to_numpy()
     C_full = _build_covariates(data.obs, covariates)
 
-    valid = np.isfinite(y_vec) & (donors != "nan")
+    valid = np.isfinite(y_vec) & ~donor_missing
     if valid.sum() < 2:
         raise ValueError("Not enough cells with finite `y` and valid `donor_key`.")
 
@@ -436,80 +494,81 @@ def pls_score(
 
     start = time.perf_counter()
 
-    # Standardize (on the *valid* subset to avoid NaN-contaminated stats).
-    if standardize:
-        X_valid, mean_, std_ = _standardize_columns(X_full[valid], max_value=max_value)
-    else:
-        X_valid = X_full[valid].copy()
-        mean_, std_ = np.zeros(X_full.shape[1]), np.ones(X_full.shape[1])
-        if max_value is not None:
-            np.clip(X_valid, -max_value, max_value, out=X_valid)
-
+    X_valid = X_full[valid]
     y_valid = y_vec[valid].astype(np.float64)
     donors_valid = donors[valid]
     C_valid = C_full[valid] if C_full is not None else None
 
-    # ---- Donor-grouped out-of-fold PLS ----
-    oof = np.full((X_valid.shape[0], n_components), np.nan, dtype=np.float64)
     rng = np.random.default_rng(random_state)
-    # GroupKFold is deterministic; we shuffle donor order for stability across runs.
-    order = rng.permutation(np.arange(X_valid.shape[0]))
-    inv_order = np.argsort(order)
-    X_ord = X_valid[order]
-    y_ord = y_valid[order]
-    g_ord = donors_valid[order]
-    C_ord = C_valid[order] if C_valid is not None else None
 
-    gkf = GroupKFold(n_splits=n_splits)
-    for fold, (tr, te) in enumerate(gkf.split(X_ord, y_ord, groups=g_ord)):
-        X_tr, X_te = X_ord[tr].copy(), X_ord[te].copy()
-        if C_ord is not None:
-            X_tr, beta = _residualize(X_tr, C_ord[tr])
-            C_te_aug = np.hstack([np.ones((te.size, 1)), C_ord[te]])
-            X_te = X_te - C_te_aug @ beta
-        model = PLSRegression(n_components=n_components, scale=False)
-        model.fit(X_tr, y_ord[tr])
-        oof[te] = model.transform(X_te)
+    # ---- Donor-grouped out-of-fold PLS (per-fold standardization + residualization) ----
+    oof = _oof_pls(
+        X_valid, y_valid, donors_valid, C_valid,
+        n_components, n_splits, standardize, max_value, rng,
+    )
 
-    oof = oof[inv_order]  # undo shuffle
-
-    # ---- Final full-data model for stable loadings/weights ----
-    X_fit = X_valid.copy()
+    # ---- Full-data fit for exportable loadings/weights ----
+    # Standardization here uses global stats (one-shot). Stored alongside the
+    # loadings/weights so callers can reproduce the transform on new data.
+    if standardize:
+        mean_full, std_full = _fit_standardize(X_valid)
+        X_fit = _apply_standardize(X_valid, mean_full, std_full, max_value)
+    else:
+        mean_full = np.zeros(X_valid.shape[1], dtype=np.float64)
+        std_full = np.ones(X_valid.shape[1], dtype=np.float64)
+        X_fit = np.array(X_valid, dtype=np.float64, copy=True)
+        if max_value is not None:
+            np.clip(X_fit, -max_value, max_value, out=X_fit)
     if C_valid is not None:
         X_fit, _ = _residualize(X_fit, C_valid)
     full_model = PLSRegression(n_components=n_components, scale=False)
     full_model.fit(X_fit, y_valid)
+    full_x_loadings = full_model.x_loadings_.copy()
+    full_x_weights = full_model.x_weights_.copy()
 
-    # ---- Orient PLS1 so higher = higher y ----
-    r1, _ = stats.pearsonr(oof[:, 0], y_valid)
-    if r1 < 0:
-        oof[:, 0] *= -1.0
-        r1 = -r1
+    # ---- Orient PLS1 so higher score = higher y, consistently across oof + weights ----
+    y_has_variance = np.std(y_valid, ddof=1) > 0
+    if y_has_variance:
+        in_sample = full_model.transform(X_fit)[:, 0]
+        r_full, _ = stats.pearsonr(in_sample, y_valid)
+        sign = -1.0 if (np.isfinite(r_full) and r_full < 0) else 1.0
+        oof[:, 0] *= sign
+        full_x_loadings[:, 0] *= sign
+        full_x_weights[:, 0] *= sign
+        r1_raw, _ = stats.pearsonr(oof[:, 0], y_valid)
+        r1 = float(r1_raw) if np.isfinite(r1_raw) else float("nan")
+    else:
+        logger.warning("pls_score: `y` has no variance; skipping orientation and permutation test.")
+        r1 = float("nan")
 
     # ---- Sanity diagnostics ----
     df_score = pd.DataFrame({"d": donors_valid, "s": oof[:, 0]})
-    grand_mean = df_score["s"].mean()
     between = df_score.groupby("d")["s"].mean().var(ddof=1)
     within = df_score.groupby("d")["s"].var(ddof=1).mean()
     total = df_score["s"].var(ddof=1)
-    between_frac = float(between / total) if total > 0 else float("nan")
+    between_frac = float(between / total) if total and total > 0 else float("nan")
+    within_mean = float(within) if np.isfinite(within) else float("nan")
 
+    # ---- Permutation null, using the same donor-grouped OOF procedure ----
     perm_p = None
-    if n_permutations and n_permutations > 0:
-        donor_y = (
+    if n_permutations and n_permutations > 0 and y_has_variance and np.isfinite(r1):
+        donor_y_df = (
             pd.DataFrame({"d": donors_valid, "y": y_valid})
             .drop_duplicates("d")
-            .set_index("d")["y"]
         )
-        null_r = np.empty(n_permutations)
+        donor_ids = donor_y_df["d"].to_numpy()
+        donor_ys = donor_y_df["y"].to_numpy()
+        null_abs_r = np.empty(n_permutations, dtype=np.float64)
         for i in range(n_permutations):
-            shuffled_map = dict(zip(donor_y.index, rng.permutation(donor_y.values)))
-            y_shuf = np.array([shuffled_map[d] for d in donors_valid])
-            m = PLSRegression(n_components=1, scale=False)
-            m.fit(X_fit, y_shuf)
-            s = m.transform(X_fit)[:, 0]
-            null_r[i] = abs(stats.pearsonr(s, y_shuf)[0])
-        perm_p = float((np.sum(null_r >= abs(r1)) + 1) / (n_permutations + 1))
+            shuffled_map = dict(zip(donor_ids, rng.permutation(donor_ys)))
+            y_shuf = np.array([shuffled_map[d] for d in donors_valid], dtype=np.float64)
+            oof_shuf = _oof_pls(
+                X_valid, y_shuf, donors_valid, C_valid,
+                1, n_splits, standardize, max_value, rng,
+            )
+            r_shuf, _ = stats.pearsonr(oof_shuf[:, 0], y_shuf)
+            null_abs_r[i] = abs(r_shuf) if np.isfinite(r_shuf) else 0.0
+        perm_p = float((np.sum(null_abs_r >= abs(r1)) + 1) / (n_permutations + 1))
 
     # ---- Write outputs ----
     full_oof = np.full((data.n_obs, n_components), np.nan, dtype=np.float64)
@@ -522,12 +581,13 @@ def pls_score(
     score[valid] = (r - 1) / max(len(r) - 1, 1)
     data.obs[score_key] = score
 
-    data.uns[loadings_key] = full_model.x_loadings_
-    data.uns[weights_key] = full_model.x_weights_
+    data.uns[loadings_key] = full_x_loadings
+    data.uns[weights_key] = full_x_weights
 
     diagnostics = {
-        "pearson_r_pls1_y": float(r1),
+        "pearson_r_pls1_y": r1,
         "between_donor_variance_fraction": between_frac,
+        "within_donor_variance_mean": within_mean,
         "n_cells_scored": int(valid.sum()),
         "n_donors": int(len(unique_donors)),
         "n_components": int(n_components),
@@ -544,7 +604,7 @@ def pls_score(
             time.perf_counter() - start,
         )
     )
-    if between_frac > 0.8:
+    if np.isfinite(between_frac) and between_frac > 0.8:
         logger.warning(
             "pls_score: >80%% of PLS1 variance is between-donor (%.2f). "
             "Treat this as a donor discriminator, not a disease axis.",
