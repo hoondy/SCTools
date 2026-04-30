@@ -2,7 +2,7 @@
 
 from ._shared import (
     Path,
-    SparseDataset,
+    _as_sparse_dataset,
     _empty_csr,
     _matrix_shape,
     _require_csr_group,
@@ -135,7 +135,7 @@ def concat_on_disk(input_pths, output_pth, temp_pth="temp.h5ad"):
     with h5py.File(output_pth, "a") as target:
         write_elem(target, "X", _empty_csr(n_variables))
 
-        mtx = SparseDataset(target["X"])
+        mtx = _as_sparse_dataset(target["X"])
         for pth in input_pths:
             with h5py.File(pth, "r") as src:
                 if src["X"].attrs["encoding-type"] == "csc_matrix":
@@ -149,9 +149,9 @@ def concat_on_disk(input_pths, output_pth, temp_pth="temp.h5ad"):
                         write_elem(tmp, "X", csr_mat)
 
                     with h5py.File(temp_pth, "r") as tmp:
-                        mtx.append(SparseDataset(tmp["X"]))
+                        mtx.append(_as_sparse_dataset(tmp["X"]))
                 else:
-                    mtx.append(SparseDataset(src["X"]))
+                    mtx.append(_as_sparse_dataset(src["X"]))
 
     temp_path = Path(temp_pth)
     if temp_path.exists():
@@ -182,7 +182,7 @@ def write_h5ad_with_new_annotation(orig_h5ad, adata, new_h5ad, raw=True):
     with h5py.File(new_h5ad, "a") as target:
         with h5py.File(orig_h5ad, "r") as src:
             write_elem(target, "X", _empty_csr(adata.var.shape[0]))
-            SparseDataset(target["X"]).append(SparseDataset(src["X"]))
+            _as_sparse_dataset(target["X"]).append(_as_sparse_dataset(src["X"]))
 
             if raw and "raw" in src:
                 target.copy(src["raw"], "raw")
@@ -261,7 +261,7 @@ def ondisk_subset(orig_h5ad, new_h5ad, subset_obs, subset_var=None, chunk_size=5
                 tmp_csr.sort_indices()
 
             with h5py.File(new_h5ad, "a") as target:
-                SparseDataset(target["X"]).append(tmp_csr)
+                _as_sparse_dataset(target["X"]).append(tmp_csr)
 
             if raw:
                 with h5py.File(orig_h5ad, "r") as f:
@@ -289,7 +289,7 @@ def ondisk_subset(orig_h5ad, new_h5ad, subset_obs, subset_var=None, chunk_size=5
                     tmp_csr.sort_indices()
 
                 with h5py.File(new_h5ad, "a") as target:
-                    SparseDataset(target["raw/X"]).append(tmp_csr)
+                    _as_sparse_dataset(target["raw/X"]).append(tmp_csr)
 
 
 def save(data, filename):

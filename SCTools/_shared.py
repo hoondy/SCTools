@@ -15,15 +15,36 @@ from anndata.experimental import read_elem, write_elem
 from scipy import sparse, stats
 
 try:
-    from anndata._core.sparse_dataset import SparseDataset
+    from anndata.experimental import sparse_dataset as _public_sparse_dataset
 except ImportError:
-    from anndata._core.sparse_dataset import BaseCompressedSparseDataset as SparseDataset
+    _public_sparse_dataset = None
 
+_legacy_sparse_dataset = None
+if _public_sparse_dataset is None:
+    try:
+        from anndata._core.sparse_dataset import SparseDataset as _legacy_sparse_dataset
+    except ImportError:
+        try:
+            from anndata._core.sparse_dataset import BaseCompressedSparseDataset as _legacy_sparse_dataset
+        except ImportError:
+            _legacy_sparse_dataset = None
 
 logger = logging.getLogger("SCTools")
 _SCANPY_CONFIGURED = False
 _SEABORN_CONFIGURED = False
 _LEGACY_MITOCARTA_PATH = Path("/sc/arion/projects/CommonMind/leed62/ref/MitoCarta/Human.MitoCarta3.0.csv")
+
+
+def _as_sparse_dataset(group):
+    """Return an append-capable sparse dataset wrapper across AnnData versions."""
+    if _public_sparse_dataset is not None:
+        return _public_sparse_dataset(group)
+    if _legacy_sparse_dataset is None:
+        raise ImportError(
+            "This AnnData version does not expose a compatible sparse dataset API. "
+            "Upgrade AnnData or install an older SCTools-compatible AnnData release."
+        )
+    return _legacy_sparse_dataset(group)
 
 
 def _require_optional_dependency(module_name, install_name=None):
