@@ -5,6 +5,7 @@ import importlib
 import logging
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
 import anndata as ad
@@ -45,6 +46,18 @@ def _as_sparse_dataset(group):
             "Upgrade AnnData or install an older SCTools-compatible AnnData release."
         )
     return _legacy_sparse_dataset(group)
+
+
+def _skip_anndata_index_checks():
+    """Locally disable expensive AnnData index uniqueness checks when supported."""
+    override = getattr(getattr(ad, "settings", None), "override", None)
+    if override is None:
+        return nullcontext()
+
+    try:
+        return override(check_uniqueness=False)
+    except (AttributeError, KeyError, TypeError):
+        return nullcontext()
 
 
 def _require_optional_dependency(module_name, install_name=None):

@@ -1,4 +1,5 @@
 import unittest
+from contextlib import nullcontext
 
 import SCTools._shared as shared
 
@@ -39,6 +40,42 @@ class SparseDatasetCompatibilityTests(unittest.TestCase):
 
         with self.assertRaises(ImportError):
             shared._as_sparse_dataset("X")
+
+
+class AnnDataIndexCheckOverrideTests(unittest.TestCase):
+    _missing = object()
+
+    def setUp(self):
+        self.original_settings = getattr(shared.ad, "settings", self._missing)
+
+    def tearDown(self):
+        if self.original_settings is self._missing:
+            if hasattr(shared.ad, "settings"):
+                delattr(shared.ad, "settings")
+        else:
+            shared.ad.settings = self.original_settings
+
+    def test_skip_anndata_index_checks_uses_local_override(self):
+        calls = []
+
+        class Settings:
+            def override(self, **overrides):
+                calls.append(overrides)
+                return nullcontext()
+
+        shared.ad.settings = Settings()
+
+        with shared._skip_anndata_index_checks():
+            pass
+
+        self.assertEqual(calls, [{"check_uniqueness": False}])
+
+    def test_skip_anndata_index_checks_is_noop_without_settings(self):
+        if hasattr(shared.ad, "settings"):
+            delattr(shared.ad, "settings")
+
+        with shared._skip_anndata_index_checks():
+            pass
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from ._shared import (
     _empty_csr,
     _matrix_shape,
     _require_csr_group,
+    _skip_anndata_index_checks,
     _write_raw_annotations,
     ad,
     clean_unused_categories,
@@ -21,7 +22,8 @@ from ._shared import (
 
 def proc_h5ad_v2(filepath):
     """Normalize selected observation and variable annotations in an H5AD."""
-    adata = ad.read_h5ad(filepath)
+    with _skip_anndata_index_checks():
+        adata = ad.read_h5ad(filepath)
 
     adata.obs["Channel"] = [x[0] + "-" + x[1] for x in zip(adata.obs.SubID_cs, adata.obs.rep)]
     adata.obs = adata.obs[["Channel", "SubID_cs", "round_num", "batch", "prep", "rep", "HTO_n_cs"]]
@@ -42,7 +44,8 @@ def proc_h5ad_v3(filepath, dummy_adata):
     dummy_adata.X.indptr = dummy_adata.X.indptr.astype(np.int64)
     dummy_adata.X.indices = dummy_adata.X.indices.astype(np.int64)
 
-    adata = ad.read_h5ad(filepath)
+    with _skip_anndata_index_checks():
+        adata = ad.read_h5ad(filepath)
 
     adata.obs["Channel"] = [x[0] + "-" + x[1] for x in zip(adata.obs.SubID_vS, adata.obs.rep)]
     adata.obs = adata.obs[
@@ -57,7 +60,8 @@ def proc_h5ad_v3(filepath, dummy_adata):
 
     adata.var.index = [x.replace("_index", "") for x in adata.var.index]
 
-    adata = ad.concat([dummy_adata, adata], join="outer", merge="same")
+    with _skip_anndata_index_checks():
+        adata = ad.concat([dummy_adata, adata], join="outer", merge="same")
     adata.X.sort_indices()
 
     if adata.var_names.to_list() != sorted(adata.var_names):
@@ -83,7 +87,8 @@ def proc_manifest(manifest_file, prefix, postfix, chunk_size, dummy_adata):
 
         outfilename = prefix + "_raw_" + postfix + str((j + 1)) + ".h5ad"
 
-        adata = ad.concat(list_adata, join="outer", merge="same")
+        with _skip_anndata_index_checks():
+            adata = ad.concat(list_adata, join="outer", merge="same")
         adata.X.sort_indices()
         adata.X.indptr = adata.X.indptr.astype(np.int64)
         adata.X.indices = adata.X.indices.astype(np.int64)
@@ -102,7 +107,8 @@ def read_everything_but_X(pth) -> ad.AnnData:
     """Read an H5AD without loading `X` or `raw/X`."""
     with h5py.File(pth) as f:
         attrs = [key for key in f.keys() if key not in {"X", "raw"}]
-        adata = ad.AnnData(**{k: read_elem(f[k]) for k in attrs})
+        with _skip_anndata_index_checks():
+            adata = ad.AnnData(**{k: read_elem(f[k]) for k in attrs})
         print(adata.shape)
     return adata
 
@@ -126,7 +132,8 @@ def csc2csr_on_disk(input_pth, output_pth):
 
 def concat_on_disk(input_pths, output_pth, temp_pth="temp.h5ad"):
     """Concatenate H5AD files without materializing the full matrix in memory."""
-    annotations = ad.concat([read_everything_but_X(pth) for pth in input_pths], merge="same")
+    with _skip_anndata_index_checks():
+        annotations = ad.concat([read_everything_but_X(pth) for pth in input_pths], merge="same")
     annotations.write_h5ad(output_pth)
     n_variables = annotations.shape[1]
 
@@ -167,17 +174,18 @@ def write_h5ad_with_new_annotation(orig_h5ad, adata, new_h5ad, raw=True):
     new_varp = adata.varp if adata.varp else None
     new_layers = adata.layers if adata.layers else None
 
-    ad.AnnData(
-        None,
-        obs=adata.obs,
-        var=adata.var,
-        uns=new_uns,
-        obsm=new_obsm,
-        varm=new_varm,
-        obsp=new_obsp,
-        varp=new_varp,
-        layers=new_layers,
-    ).write(new_h5ad)
+    with _skip_anndata_index_checks():
+        ad.AnnData(
+            None,
+            obs=adata.obs,
+            var=adata.var,
+            uns=new_uns,
+            obsm=new_obsm,
+            varm=new_varm,
+            obsp=new_obsp,
+            varp=new_varp,
+            layers=new_layers,
+        ).write(new_h5ad)
 
     with h5py.File(new_h5ad, "a") as target:
         with h5py.File(orig_h5ad, "r") as src:
@@ -215,17 +223,18 @@ def ondisk_subset(orig_h5ad, new_h5ad, subset_obs, subset_var=None, chunk_size=5
     new_varp = adata.varp if adata.varp else None
     new_layers = adata.layers if adata.layers else None
 
-    ad.AnnData(
-        None,
-        obs=adata.obs,
-        var=adata.var,
-        uns=new_uns,
-        obsm=new_obsm,
-        varm=new_varm,
-        obsp=new_obsp,
-        varp=new_varp,
-        layers=new_layers,
-    ).write(new_h5ad)
+    with _skip_anndata_index_checks():
+        ad.AnnData(
+            None,
+            obs=adata.obs,
+            var=adata.var,
+            uns=new_uns,
+            obsm=new_obsm,
+            varm=new_varm,
+            obsp=new_obsp,
+            varp=new_varp,
+            layers=new_layers,
+        ).write(new_h5ad)
 
     with h5py.File(new_h5ad, "a") as target:
         write_elem(target, "X", _empty_csr(adata.var.shape[0]))
@@ -296,7 +305,8 @@ def save(data, filename):
     """Convert a Pegasus object to AnnData and write it to disk."""
     if "_tmp_fmat_highly_variable_features" in data.uns:
         del data.uns["_tmp_fmat_highly_variable_features"]
-    data.to_anndata().write(filename)
+    with _skip_anndata_index_checks():
+        data.to_anndata().write(filename)
     print("Saved", filename)
 
 
