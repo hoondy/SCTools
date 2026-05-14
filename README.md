@@ -78,29 +78,6 @@ Cluster and annotate cell types on a PCA embedding, then apply PLS **within a
 cell type** to recover the disease axis. Treat PLS output as a focused
 analysis tool, not as the general embedding used for clustering.
 
-## Embedding outlier detection
-
-`sct.tl.detect_outliers` detects extreme cells within annotation groups and
-writes `adata.obs["outlier"]` as a 0/1 label, where 1 means outlier. It uses
-DBSCAN by default and switches to LocalOutlierFactor for very large groups to
-avoid constructing a large radius-neighbor graph.
-
-```python
-summary = sct.tl.detect_outliers(
-    adata,
-    groupby="subclass",
-    use_rep="X_umap",
-    force_outlier={"subclass": ["EN_NF"], "subtype": ["Immune_PVM"]},
-)
-
-# adata.obs["outlier"] -> 0/1 outlier label
-# summary              -> per-group method, parameter, and removal counts
-```
-
-For production filtering, prefer a biologically meaningful integrated/PCA
-representation when available; UMAP is useful for catching visually obvious
-embedding islands, but its local distances are not calibrated across the map.
-
 ### `sct.tl.pls` — supervised embedding
 
 Fits PLS on the full dataset and stores a per-cell embedding for downstream
@@ -190,6 +167,29 @@ sc.pl.umap(mg, color="pls_disease_score", cmap="magma")
 - Treat the PLS axis as a **hypothesis generator**. Validate the resulting
   gene signature on independent data (other cohorts, bulk RNA-seq, spatial)
   before drawing biological conclusions.
+
+## Embedding outlier detection
+
+`sct.tl.detect_outliers` detects extreme cells within annotation groups and
+writes `adata.obs["outlier"]` as a 0/1 label, where 1 means outlier. It uses
+DBSCAN by default and switches to LocalOutlierFactor for very large groups to
+avoid constructing a large radius-neighbor graph.
+
+```python
+summary = sct.tl.detect_outliers(
+    adata,
+    groupby="subclass",
+    use_rep="X_umap",
+    force_outlier={"subclass": ["EN_NF"], "subtype": ["Immune_PVM"]},
+)
+
+# adata.obs["outlier"] -> 0/1 outlier label
+# summary              -> per-group method, parameter, and removal counts
+```
+
+For production filtering, prefer a biologically meaningful integrated/PCA
+representation when available; UMAP is useful for catching visually obvious
+embedding islands, but its local distances are not calibrated across the map.
 
 ## Notes
 
