@@ -4,6 +4,7 @@ from ._shared import (
     _get_sample_size,
     _require_group_kfold,
     _require_numpy_groupies,
+    _require_optional_dependency,
     _require_pairwise_metrics,
     _require_pegasus,
     _require_pls_regression,
@@ -284,6 +285,333 @@ def diff_markers(marker_dict_res, test, ref):
     ref_set = marker_dict_res[ref]["up"]
     ref_set = set(ref_set[ref_set.log2Mean_other < 1][:100].index)
     return test_set - ref_set
+
+
+def _require_outlier_estimators():
+    neighbors = _require_optional_dependency("sklearn.neighbors", "scikit-learn")
+    cluster = _require_optional_dependency("sklearn.cluster", "scikit-learn")
+    return neighbors.LocalOutlierFactor, neighbors.NearestNeighbors, cluster.DBSCAN
+
+
+def _bounded_count(n_obs, explicit, frac, minimum, maximum, *, lower=1, upper=None):
+    """Return a model parameter count clipped to the feasible group size."""
+    if n_obs < lower:
+        return None
+    if explicit is None:
+        value = int(n_obs * frac)
+        value = max(min(value, maximum), minimum)
+    else:
+        value = int(explicit)
+    max_allowed = n_obs if upper is None else min(n_obs, upper)
+    return max(lower, min(value, max_allowed))
+
+
+def _iter_obs_groups(obs, groupby):
+    """Yield positional indices for each requested observation group."""
+    if groupby is None:
+        yield "all", np.arange(obs.shape[0])
+        return
+
+    columns = [groupby] if isinstance(groupby, str) else list(groupby)
+    missing = [column for column in columns if column not in obs.columns]
+    if missing:
+        raise KeyError(f"Missing groupby column(s) in `.obs`: {missing}.")
+
+    grouping_frame = obs.loc[:, columns].reset_index(drop=True)
+    indices = grouping_frame.groupby(columns, observed=True, dropna=False, sort=True).indices
+    for key, positions in indices.items():
+        if not isinstance(key, tuple):
+            key = (key,)
+        label = "|".join(str(value) for value in key)
+        yield label, np.asarray(positions, dtype=int)
+
+
+def _as_obs_mask(adata, selector, *, name):
+    """Coerce a selector into a boolean mask over adata.obs."""
+    mask = np.zeros(adata.n_obs, dtype=bool)
+    if selector is None:
+        return mask
+
+    if callable(selector):
+        values = selector(adata.obs)
+    elif isinstance(selector, dict):
+        for column, allowed in selector.items():
+            if column not in adata.obs.columns:
+                raise KeyError(f"`{name}` references missing `.obs` column {column!r}.")
+            if isinstance(allowed, (str, bytes)):
+                allowed_values = [allowed]
+            else:
+                try:
+                    allowed_values = list(allowed)
+                except TypeError:
+                    allowed_values = [allowed]
+            mask |= adata.obs[column].isin(allowed_values).to_numpy()
+        return mask
+    else:
+        values = selector
+
+    if isinstance(values, pd.Series):
+        if values.index.equals(adata.obs.index):
+            arr = values.to_numpy()
+        elif len(values) == adata.n_obs:
+            arr = values.to_numpy()
+        else:
+            arr = values.reindex(adata.obs.index).fillna(False).to_numpy()
+    else:
+        arr = np.asarray(values)
+
+    if arr.shape[0] != adata.n_obs:
+        raise ValueError(f"`{name}` must have length {adata.n_obs}; found {arr.shape[0]}.")
+    return arr.astype(bool)
+
+
+def detect_outliers(
+    adata: ad.AnnData,
+    groupby: str = "subclass",
+    use_rep: str = "X_umap",
+    outlier_key: str = "outlier",
+    method: str = "auto",
+    large_group_threshold: int = 300_000,
+    min_group_size: int = 100,
+    dbscan_eps: float = 1.0,
+    dbscan_radius: float = None,
+    dbscan_min_samples: int = None,
+    dbscan_min_samples_frac: float = 0.02,
+    dbscan_min_samples_min: int = 100,
+    dbscan_min_samples_max: int = 2_000,
+    lof_n_neighbors: int = None,
+    lof_n_neighbors_frac: float = 0.04,
+    lof_n_neighbors_min: int = 100,
+    lof_n_neighbors_max: int = 4_000,
+    lof_contamination="auto",
+    metric: str = "euclidean",
+    n_jobs: int = -1,
+    force_outlier=None,
+    force_inlier=None,
+    invalid_policy: str = "outlier",
+    store_details: bool = True,
+    diagnostics_key: str = "outlier_detection",
+) -> pd.DataFrame:
+    """Detect extreme embedding outliers and write ``adata.obs[outlier_key]``.
+
+    The default behavior mirrors the hybrid workflow used in the PsychAD
+    notebook: cells are processed within annotation groups, DBSCAN is used for
+    ordinary-size groups, and LocalOutlierFactor is used for groups above
+    ``large_group_threshold`` to avoid building a very large radius graph.
+
+    ``adata.obs[outlier_key]`` is written as an integer 0/1 label where 1 means
+    outlier. A per-group summary DataFrame is returned and, by default, stored
+    with parameters in ``adata.uns[diagnostics_key]``.
+
+    Parameters
+    ----------
+    adata
+        AnnData object containing the embedding in ``adata.obsm[use_rep]``.
+    groupby
+        Observation column used to fit separate outlier models. Set to ``None``
+        to fit one model across all cells.
+    use_rep
+        Key in ``adata.obsm`` to use as the outlier-detection embedding.
+    method
+        ``"auto"``, ``"dbscan"``, or ``"lof"``. ``"auto"`` switches to LOF only
+        for groups larger than ``large_group_threshold``.
+    force_outlier, force_inlier
+        Optional manual overrides. Pass a boolean mask, callable returning a
+        mask, or a dict such as
+        ``{"subclass": ["EN_NF"], "subtype": ["Immune_PVM"]}``.
+    invalid_policy
+        How to label cells with non-finite embedding coordinates: ``"outlier"``
+        or ``"inlier"``.
+    store_details
+        If True, also writes method, score, and DBSCAN cluster labels to
+        ``adata.obs`` and stores diagnostics in ``adata.uns``.
+    """
+    if use_rep not in adata.obsm:
+        raise KeyError(f"`{use_rep}` not found in `adata.obsm`.")
+    if method not in {"auto", "dbscan", "lof"}:
+        raise ValueError("`method` must be one of 'auto', 'dbscan', or 'lof'.")
+    if invalid_policy not in {"outlier", "inlier"}:
+        raise ValueError("`invalid_policy` must be 'outlier' or 'inlier'.")
+    if dbscan_eps <= 0:
+        raise ValueError("`dbscan_eps` must be positive.")
+    if dbscan_radius is None:
+        dbscan_radius = dbscan_eps
+    if dbscan_radius < dbscan_eps:
+        raise ValueError("`dbscan_radius` must be greater than or equal to `dbscan_eps`.")
+    if min_group_size < 1:
+        raise ValueError("`min_group_size` must be positive.")
+
+    X = np.asarray(adata.obsm[use_rep])
+    if X.ndim != 2:
+        raise ValueError(f"`adata.obsm[{use_rep!r}]` must be a 2D array.")
+    if X.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"`adata.obsm[{use_rep!r}]` has {X.shape[0]} rows but adata has {adata.n_obs} observations."
+        )
+
+    LocalOutlierFactor, NearestNeighbors, DBSCAN = _require_outlier_estimators()
+
+    outlier = np.zeros(adata.n_obs, dtype=bool)
+    method_used = np.full(adata.n_obs, "unassigned", dtype=object)
+    score = np.full(adata.n_obs, np.nan, dtype=np.float64)
+    dbscan_label = np.full(adata.n_obs, pd.NA, dtype=object)
+    rows = []
+
+    for group_name, positions in _iter_obs_groups(adata.obs, groupby):
+        group_X = X[positions]
+        finite = np.isfinite(group_X).all(axis=1)
+        finite_positions = positions[finite]
+        invalid_positions = positions[~finite]
+
+        if invalid_positions.size:
+            outlier[invalid_positions] = invalid_policy == "outlier"
+            method_used[invalid_positions] = "invalid_embedding"
+
+        n_cells = positions.size
+        n_scored = finite_positions.size
+        row = {
+            "group": group_name,
+            "n_cells": int(n_cells),
+            "n_scored": int(n_scored),
+            "n_invalid": int(invalid_positions.size),
+            "method": "skipped",
+            "parameter": pd.NA,
+            "n_outliers": int(outlier[invalid_positions].sum()),
+        }
+
+        if n_scored < min_group_size:
+            method_used[finite_positions] = "skipped_small_group"
+            rows.append(row)
+            continue
+
+        chosen = method
+        if chosen == "auto":
+            chosen = "lof" if n_scored > large_group_threshold else "dbscan"
+
+        scored_X = X[finite_positions]
+        if chosen == "lof":
+            n_neighbors = _bounded_count(
+                n_scored,
+                lof_n_neighbors,
+                lof_n_neighbors_frac,
+                lof_n_neighbors_min,
+                lof_n_neighbors_max,
+                lower=2,
+                upper=n_scored - 1,
+            )
+            if n_neighbors is None:
+                method_used[finite_positions] = "skipped_small_group"
+                rows.append(row)
+                continue
+
+            clf = LocalOutlierFactor(
+                n_neighbors=n_neighbors,
+                contamination=lof_contamination,
+                metric=metric,
+                n_jobs=n_jobs,
+            )
+            labels = clf.fit_predict(scored_X)
+            group_outlier = labels == -1
+            outlier[finite_positions] = group_outlier
+            method_used[finite_positions] = "lof"
+            score[finite_positions] = -clf.negative_outlier_factor_
+            row.update(
+                {
+                    "method": "lof",
+                    "parameter": int(n_neighbors),
+                    "n_outliers": int(group_outlier.sum() + outlier[invalid_positions].sum()),
+                }
+            )
+
+        elif chosen == "dbscan":
+            min_samples = _bounded_count(
+                n_scored,
+                dbscan_min_samples,
+                dbscan_min_samples_frac,
+                dbscan_min_samples_min,
+                dbscan_min_samples_max,
+                lower=2,
+            )
+            if min_samples is None:
+                method_used[finite_positions] = "skipped_small_group"
+                rows.append(row)
+                continue
+
+            nn = NearestNeighbors(radius=dbscan_radius, metric=metric, n_jobs=n_jobs)
+            nn.fit(scored_X)
+            graph = nn.radius_neighbors_graph(scored_X, mode="distance", sort_results=True)
+            clf = DBSCAN(eps=dbscan_eps, min_samples=min_samples, metric="precomputed", n_jobs=n_jobs)
+            labels = clf.fit_predict(graph)
+            group_outlier = labels == -1
+            outlier[finite_positions] = group_outlier
+            method_used[finite_positions] = "dbscan"
+            score[finite_positions] = min_samples - graph.getnnz(axis=1)
+            dbscan_label[finite_positions] = labels.astype(int)
+            row.update(
+                {
+                    "method": "dbscan",
+                    "parameter": int(min_samples),
+                    "n_outliers": int(group_outlier.sum() + outlier[invalid_positions].sum()),
+                }
+            )
+        else:
+            raise ValueError(f"Unexpected outlier method {chosen!r}.")
+
+        rows.append(row)
+
+    force_inlier_mask = _as_obs_mask(adata, force_inlier, name="force_inlier")
+    force_outlier_mask = _as_obs_mask(adata, force_outlier, name="force_outlier")
+    if force_inlier_mask.any():
+        outlier[force_inlier_mask] = False
+        method_used[force_inlier_mask] = "forced_inlier"
+    if force_outlier_mask.any():
+        outlier[force_outlier_mask] = True
+        method_used[force_outlier_mask] = "forced_outlier"
+
+    adata.obs[outlier_key] = outlier.astype(int)
+
+    summary = pd.DataFrame(rows)
+    if not summary.empty:
+        summary = summary.rename(columns={"n_outliers": "n_model_outliers"})
+        final_counts = [
+            int(outlier[positions].sum())
+            for _, positions in _iter_obs_groups(adata.obs, groupby)
+        ]
+        summary["n_outliers"] = final_counts
+        summary["model_outlier_fraction"] = summary["n_model_outliers"] / summary["n_cells"]
+        summary["outlier_fraction"] = summary["n_outliers"] / summary["n_cells"]
+
+    if store_details:
+        adata.obs[f"{outlier_key}_method"] = pd.Categorical(method_used)
+        adata.obs[f"{outlier_key}_score"] = score
+        if np.any(pd.notna(dbscan_label)):
+            adata.obs[f"{outlier_key}_dbscan_label"] = pd.array(dbscan_label, dtype="Int64")
+
+        adata.uns[diagnostics_key] = {
+            "use_rep": use_rep,
+            "groupby": groupby,
+            "method": method,
+            "large_group_threshold": int(large_group_threshold),
+            "min_group_size": int(min_group_size),
+            "dbscan_eps": float(dbscan_eps),
+            "dbscan_radius": float(dbscan_radius),
+            "dbscan_min_samples_frac": float(dbscan_min_samples_frac),
+            "dbscan_min_samples_min": int(dbscan_min_samples_min),
+            "dbscan_min_samples_max": int(dbscan_min_samples_max),
+            "lof_n_neighbors_frac": float(lof_n_neighbors_frac),
+            "lof_n_neighbors_min": int(lof_n_neighbors_min),
+            "lof_n_neighbors_max": int(lof_n_neighbors_max),
+            "lof_contamination": lof_contamination,
+            "metric": metric,
+            "n_cells": int(adata.n_obs),
+            "n_outliers": int(outlier.sum()),
+            "outlier_fraction": float(outlier.mean()) if adata.n_obs else 0.0,
+            "n_forced_outlier": int(force_outlier_mask.sum()),
+            "n_forced_inlier": int(force_inlier_mask.sum()),
+            "group_summary": summary,
+        }
+
+    return summary
 
 
 def pls(
@@ -618,6 +946,7 @@ __all__ = [
     "corrMat",
     "cos_similarity",
     "diff_markers",
+    "detect_outliers",
     "info",
     "l2_distance",
     "pb_agg_by_cluster",

@@ -37,7 +37,7 @@ pip install pegasuspy scanpy scikit-learn seaborn matplotlib adjustText numpy-gr
 
 - `sct.io`: `read_everything_but_X`, `csc2csr_on_disk`, `concat_on_disk`, `ondisk_subset`, `write_h5ad_with_new_annotation`, `proc_h5ad_v2`, `proc_h5ad_v3`, `proc_manifest`, and `save`
 - `sct.pp`: preprocessing helpers such as HVG selection, PCA, QC boundaries, signature scores, and category cleanup
-- `sct.tl`: aggregation, similarity, marker, PLS, and pseudometacell helpers
+- `sct.tl`: aggregation, similarity, marker, PLS, outlier detection, and pseudometacell helpers
 - `sct.pl`: scree plots, correlation plots, palettes, and Sankey diagrams
 
 Functions are intentionally namespaced. Use `sct.io.read_everything_but_X(...)` rather than `sct.read_everything_but_X(...)`.
@@ -77,6 +77,29 @@ replacement for PCA.
 Cluster and annotate cell types on a PCA embedding, then apply PLS **within a
 cell type** to recover the disease axis. Treat PLS output as a focused
 analysis tool, not as the general embedding used for clustering.
+
+## Embedding outlier detection
+
+`sct.tl.detect_outliers` detects extreme cells within annotation groups and
+writes `adata.obs["outlier"]` as a 0/1 label, where 1 means outlier. It uses
+DBSCAN by default and switches to LocalOutlierFactor for very large groups to
+avoid constructing a large radius-neighbor graph.
+
+```python
+summary = sct.tl.detect_outliers(
+    adata,
+    groupby="subclass",
+    use_rep="X_umap",
+    force_outlier={"subclass": ["EN_NF"], "subtype": ["Immune_PVM"]},
+)
+
+# adata.obs["outlier"] -> 0/1 outlier label
+# summary              -> per-group method, parameter, and removal counts
+```
+
+For production filtering, prefer a biologically meaningful integrated/PCA
+representation when available; UMAP is useful for catching visually obvious
+embedding islands, but its local distances are not calibrated across the map.
 
 ### `sct.tl.pls` — supervised embedding
 
