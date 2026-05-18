@@ -179,9 +179,24 @@ def _empty_csr(n_vars):
     return dummy_x
 
 
+def _subset_axis_length(axis_length, subset, *, label):
+    if subset is None:
+        return axis_length
+    subset = np.asarray(subset)
+    if subset.dtype == bool:
+        if subset.shape[0] != axis_length:
+            raise ValueError(f"Boolean subset for {label} has length {subset.shape[0]}, expected {axis_length}.")
+        return int(np.count_nonzero(subset))
+    return subset.shape[0]
+
+
 def _write_raw_annotations(target, src, subset_var=None):
-    if "raw" not in src:
+    if "raw" not in src or "X" not in src["raw"]:
         return None
+
+    raw_n_vars = _matrix_shape(src["raw/X"])[1]
+    if "var" not in src["raw"]:
+        return _subset_axis_length(raw_n_vars, subset_var, label="`raw/X` variables")
 
     raw_var = read_elem(src["raw/var"])
     if subset_var is not None:

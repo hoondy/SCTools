@@ -18,6 +18,13 @@ def _encoding_type(group):
     return encoding
 
 
+def _read_csr_group(group):
+    return sparse.csr_matrix(
+        (group["data"][:], group["indices"][:], group["indptr"][:]),
+        shape=tuple(group.attrs["shape"]),
+    )
+
+
 class IOHelpersTests(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
@@ -130,6 +137,33 @@ class IOHelpersTests(unittest.TestCase):
             adata.raw.X.toarray()[subset_obs][:, subset_var],
         )
         self.assertListEqual(restored.var_names.tolist(), ["g1", "g3"])
+
+    def test_ondisk_subset_handles_raw_x_without_raw_var(self):
+        source = self.tmp / "subset_raw_without_var_source.h5ad"
+        output = self.tmp / "subset_raw_without_var_output.h5ad"
+        adata = self._make_adata()
+        adata.write_h5ad(source)
+
+        with h5py.File(source, "a") as handle:
+            del handle["raw/var"]
+            if "varm" in handle["raw"]:
+                del handle["raw/varm"]
+
+        subset_obs = np.array([True, False, True])
+        subset_var = np.array([True, False, True])
+
+        sct.io.ondisk_subset(source, output, subset_obs=subset_obs, subset_var=subset_var, raw=True)
+
+        with h5py.File(output, "r") as handle:
+            self.assertIn("raw", handle)
+            self.assertIn("X", handle["raw"])
+            self.assertNotIn("var", handle["raw"])
+            raw_x = _read_csr_group(handle["raw/X"])
+
+        np.testing.assert_array_equal(
+            raw_x.toarray(),
+            adata.raw.X.toarray()[subset_obs][:, subset_var],
+        )
 
     def test_namespace_modules_are_exposed(self):
         self.assertTrue(hasattr(sct, "pl"))
