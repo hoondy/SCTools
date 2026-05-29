@@ -78,5 +78,64 @@ class AnnDataIndexCheckOverrideTests(unittest.TestCase):
             pass
 
 
+class ScanpyCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.original_require_optional_dependency = shared._require_optional_dependency
+        self.original_scanpy_configured = shared._SCANPY_CONFIGURED
+
+    def tearDown(self):
+        shared._require_optional_dependency = self.original_require_optional_dependency
+        shared._SCANPY_CONFIGURED = self.original_scanpy_configured
+
+    def test_require_scanpy_disables_ipython_display_format_setup(self):
+        calls = []
+
+        class Settings:
+            verbosity = None
+
+        class FakeScanpy:
+            settings = Settings()
+
+            def set_figure_params(self, **kwargs):
+                calls.append(kwargs)
+
+        fake_scanpy = FakeScanpy()
+        shared._SCANPY_CONFIGURED = False
+        shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+
+        self.assertIs(shared._require_scanpy(), fake_scanpy)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]["ipython_format"])
+        self.assertEqual(fake_scanpy.settings.verbosity, 1)
+        self.assertTrue(shared._SCANPY_CONFIGURED)
+
+    def test_require_scanpy_supports_scanpy_without_ipython_format_keyword(self):
+        calls = []
+
+        class Settings:
+            verbosity = None
+
+        class FakeScanpy:
+            settings = Settings()
+
+            def set_figure_params(self, **kwargs):
+                calls.append(kwargs)
+                if "ipython_format" in kwargs:
+                    raise TypeError("unexpected keyword argument 'ipython_format'")
+
+        fake_scanpy = FakeScanpy()
+        shared._SCANPY_CONFIGURED = False
+        shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+
+        self.assertIs(shared._require_scanpy(), fake_scanpy)
+
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["ipython_format"])
+        self.assertNotIn("ipython_format", calls[1])
+        self.assertEqual(fake_scanpy.settings.verbosity, 1)
+        self.assertTrue(shared._SCANPY_CONFIGURED)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -80,13 +80,21 @@ def _require_scanpy():
     sc = _require_optional_dependency("scanpy")
     global _SCANPY_CONFIGURED
     if not _SCANPY_CONFIGURED:
-        sc.set_figure_params(
-            scanpy=True,
-            dpi=100,
-            dpi_save=300,
-            fontsize=12,
-            color_map="YlOrRd",
-        )
+        figure_params = {
+            "scanpy": True,
+            "dpi": 100,
+            "dpi_save": 300,
+            "fontsize": 12,
+            "color_map": "YlOrRd",
+            "ipython_format": None,
+        }
+        try:
+            sc.set_figure_params(**figure_params)
+        except TypeError as exc:
+            if "ipython_format" not in str(exc):
+                raise
+            figure_params.pop("ipython_format")
+            sc.set_figure_params(**figure_params)
         sc.settings.verbosity = 1
         _SCANPY_CONFIGURED = True
     return sc
