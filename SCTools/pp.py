@@ -8,6 +8,7 @@ from ._shared import (
     _require_raw,
     _require_scanpy,
     clean_unused_categories,
+    gc,
     np,
     pd,
     stats,
@@ -88,43 +89,55 @@ def scanpy_hvf_h5ad(
     """Return highly variable genes from an H5AD using Scanpy."""
     sc = _require_scanpy()
 
-    adata = sc.read_h5ad(h5ad_file)
-    print(adata)
+    adata = None
+    hvg = None
+    try:
+        adata = sc.read_h5ad(h5ad_file)
+        print(adata)
 
-    if robust_protein_coding:
-        print("subset robust_protein_coding")
-        if "robust_protein_coding" not in adata.var:
-            raise KeyError("Expected `robust_protein_coding` in `.var`.")
-        adata = adata[:, adata.var.robust_protein_coding]
+        if robust_protein_coding:
+            print("subset robust_protein_coding")
+            if "robust_protein_coding" not in adata.var:
+                raise KeyError("Expected `robust_protein_coding` in `.var`.")
+            adata = adata[:, adata.var.robust_protein_coding]
 
-    if protein_coding:
-        adata = adata[:, _get_protein_coding_mask(adata.var)]
+        if protein_coding:
+            adata = adata[:, _get_protein_coding_mask(adata.var)]
 
-    if autosome:
-        adata = adata[:, _get_autosome_mask(adata.var)]
+        if autosome:
+            adata = adata[:, _get_autosome_mask(adata.var)]
 
-    if flavor == "seurat_v3":
-        _require_raw(adata, context="`scanpy_hvf_h5ad(..., flavor='seurat_v3')`")
-        adata.X = adata.raw.X
-        if n_top_genes is None:
-            raise ValueError("`n_top_genes` is mandatory if `flavor` is `seurat_v3`.")
+        if flavor == "seurat_v3":
+            _require_raw(adata, context="`scanpy_hvf_h5ad(..., flavor='seurat_v3')`")
+            adata.X = adata.raw.X
+            if n_top_genes is None:
+                raise ValueError("`n_top_genes` is mandatory if `flavor` is `seurat_v3`.")
 
-    print("scanpy hvg")
-    hvg = sc.pp.highly_variable_genes(
-        adata,
-        flavor=flavor,
-        min_mean=min_mean,
-        max_mean=max_mean,
-        min_disp=min_disp,
-        batch_key=batch_key,
-        n_top_genes=n_top_genes,
-        inplace=False,
-        subset=False,
-    )
-    print(hvg.highly_variable.value_counts())
-    sc.pl.highly_variable_genes(hvg)
+        print("scanpy hvg")
+        hvg = sc.pp.highly_variable_genes(
+            adata,
+            flavor=flavor,
+            min_mean=min_mean,
+            max_mean=max_mean,
+            min_disp=min_disp,
+            batch_key=batch_key,
+            n_top_genes=n_top_genes,
+            inplace=False,
+            subset=False,
+        )
+        print(hvg.highly_variable.value_counts())
+        sc.pl.highly_variable_genes(hvg)
 
-    return adata.var.index[hvg.highly_variable].tolist()
+        return adata.var.index[hvg.highly_variable].tolist()
+    finally:
+        if adata is not None:
+            adata_file = getattr(adata, "file", None)
+            close = getattr(adata_file, "close", None)
+            if close is not None:
+                close()
+        del hvg
+        del adata
+        gc.collect()
 
 
 def scanpy_pca(data, n_comps=50, use_highly_variable=True):
