@@ -26,6 +26,7 @@ def scanpy_hvf(
     robust_protein_coding=False,
     protein_coding=False,
     autosome=False,
+    plot=False,
 ):
     """Run Scanpy HVG selection on a Pegasus object and store the result."""
     sc = _require_scanpy()
@@ -61,7 +62,8 @@ def scanpy_hvf(
         subset=False,
     )
     print(hvg.highly_variable.value_counts())
-    sc.pl.highly_variable_genes(hvg)
+    if plot:
+        sc.pl.highly_variable_genes(hvg)
 
     data.var["highly_variable_features"] = False
     data.var.loc[hvg[hvg.highly_variable].index, "highly_variable_features"] = True
@@ -72,6 +74,23 @@ def scanpy_hvf(
         raise ValueError("`highly_variable_genes` is not the same as `highly_variable_features`.")
 
     print(data.var.highly_variable_features.value_counts())
+
+
+def _drop_scanpy_hvf_h5ad_unused_slots(adata, *, keep_raw):
+    if keep_raw:
+        if adata.raw is not None:
+            adata.raw.varm.clear()
+    else:
+        adata.raw = None
+
+    missing = object()
+    log1p = adata.uns.get("log1p", missing)
+    adata.uns.clear()
+    if log1p is not missing:
+        adata.uns["log1p"] = log1p
+
+    for attr in ("obsm", "varm", "layers", "obsp", "varp"):
+        getattr(adata, attr).clear()
 
 
 def scanpy_hvf_h5ad(
@@ -85,15 +104,19 @@ def scanpy_hvf_h5ad(
     robust_protein_coding=False,
     protein_coding=False,
     autosome=False,
+    plot=False,
 ):
     """Return highly variable genes from an H5AD using Scanpy."""
     sc = _require_scanpy()
 
+    backed_adata = None
     adata = None
     hvg = None
     try:
-        adata = sc.read_h5ad(h5ad_file)
+        backed_adata = sc.read_h5ad(h5ad_file, backed="r")
+        adata = backed_adata
         print(adata)
+        _drop_scanpy_hvf_h5ad_unused_slots(adata, keep_raw=flavor == "seurat_v3")
 
         if robust_protein_coding:
             print("subset robust_protein_coding")
@@ -109,7 +132,12 @@ def scanpy_hvf_h5ad(
 
         if flavor == "seurat_v3":
             _require_raw(adata, context="`scanpy_hvf_h5ad(..., flavor='seurat_v3')`")
+
+        adata = adata.to_memory()
+
+        if flavor == "seurat_v3":
             adata.X = adata.raw.X
+            adata.raw = None
             if n_top_genes is None:
                 raise ValueError("`n_top_genes` is mandatory if `flavor` is `seurat_v3`.")
 
@@ -126,7 +154,8 @@ def scanpy_hvf_h5ad(
             subset=False,
         )
         print(hvg.highly_variable.value_counts())
-        sc.pl.highly_variable_genes(hvg)
+        if plot:
+            sc.pl.highly_variable_genes(hvg)
 
         return adata.var.index[hvg.highly_variable].tolist()
     finally:
@@ -135,8 +164,14 @@ def scanpy_hvf_h5ad(
             close = getattr(adata_file, "close", None)
             if close is not None:
                 close()
+        if backed_adata is not None and backed_adata is not adata:
+            backed_file = getattr(backed_adata, "file", None)
+            close = getattr(backed_file, "close", None)
+            if close is not None:
+                close()
         del hvg
         del adata
+        del backed_adata
         gc.collect()
 
 
