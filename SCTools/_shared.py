@@ -107,7 +107,7 @@ def _require_scanpy():
             "dpi_save": 300,
             "fontsize": 12,
             "color_map": "YlOrRd",
-            "ipython_format": None,
+            "ipython_format": "png2x",
         }
         try:
             sc.set_figure_params(**figure_params)

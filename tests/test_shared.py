@@ -125,15 +125,32 @@ class IPythonDisplayCompatibilityTests(unittest.TestCase):
 
 
 class ScanpyCompatibilityTests(unittest.TestCase):
+    _missing = object()
+
     def setUp(self):
         self.original_require_optional_dependency = shared._require_optional_dependency
         self.original_scanpy_configured = shared._SCANPY_CONFIGURED
         self.original_patch_ipython_display = shared._patch_ipython_display_for_scanpy
+        self.module_names = [
+            "IPython",
+            "IPython.display",
+            "matplotlib_inline",
+            "matplotlib_inline.backend_inline",
+        ]
+        self.original_modules = {
+            name: sys.modules.get(name, self._missing)
+            for name in self.module_names
+        }
 
     def tearDown(self):
         shared._require_optional_dependency = self.original_require_optional_dependency
         shared._SCANPY_CONFIGURED = self.original_scanpy_configured
         shared._patch_ipython_display_for_scanpy = self.original_patch_ipython_display
+        for name, module in self.original_modules.items():
+            if module is self._missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
     def test_require_scanpy_patches_ipython_before_scanpy_setup(self):
         events = []
@@ -156,7 +173,7 @@ class ScanpyCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(events, ["patch_ipython", "set_figure_params"])
 
-    def test_require_scanpy_disables_ipython_display_format_setup(self):
+    def test_require_scanpy_uses_iterable_ipython_display_format(self):
         calls = []
 
         class Settings:
@@ -176,9 +193,47 @@ class ScanpyCompatibilityTests(unittest.TestCase):
         self.assertIs(shared._require_scanpy(), fake_scanpy)
 
         self.assertEqual(len(calls), 1)
-        self.assertIsNone(calls[0]["ipython_format"])
+        self.assertEqual(calls[0]["ipython_format"], "png2x")
         self.assertEqual(fake_scanpy.settings.verbosity, 1)
         self.assertTrue(shared._SCANPY_CONFIGURED)
+
+    def test_require_scanpy_supports_scanpy_ipython_format_unpacking(self):
+        ipython = types.ModuleType("IPython")
+        ipython_display = types.ModuleType("IPython.display")
+        matplotlib_inline = types.ModuleType("matplotlib_inline")
+        backend_inline = types.ModuleType("matplotlib_inline.backend_inline")
+        format_calls = []
+
+        def set_matplotlib_formats(*args, **kwargs):
+            format_calls.append((args, kwargs))
+
+        ipython.display = ipython_display
+        matplotlib_inline.backend_inline = backend_inline
+        backend_inline.set_matplotlib_formats = set_matplotlib_formats
+        sys.modules["IPython"] = ipython
+        sys.modules["IPython.display"] = ipython_display
+        sys.modules["matplotlib_inline"] = matplotlib_inline
+        sys.modules["matplotlib_inline.backend_inline"] = backend_inline
+
+        class Settings:
+            verbosity = None
+
+        class FakeScanpy:
+            settings = Settings()
+
+            def set_figure_params(self, **kwargs):
+                ipython_format = kwargs["ipython_format"]
+                if isinstance(ipython_format, str):
+                    ipython_format = [ipython_format]
+                ipython_display.set_matplotlib_formats(*ipython_format)
+
+        fake_scanpy = FakeScanpy()
+        shared._SCANPY_CONFIGURED = False
+        shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+
+        self.assertIs(shared._require_scanpy(), fake_scanpy)
+
+        self.assertEqual(format_calls, [(("png2x",), {})])
 
     def test_require_scanpy_supports_scanpy_without_ipython_format_keyword(self):
         calls = []
@@ -202,7 +257,7 @@ class ScanpyCompatibilityTests(unittest.TestCase):
         self.assertIs(shared._require_scanpy(), fake_scanpy)
 
         self.assertEqual(len(calls), 2)
-        self.assertIsNone(calls[0]["ipython_format"])
+        self.assertEqual(calls[0]["ipython_format"], "png2x")
         self.assertNotIn("ipython_format", calls[1])
         self.assertEqual(fake_scanpy.settings.verbosity, 1)
         self.assertTrue(shared._SCANPY_CONFIGURED)
