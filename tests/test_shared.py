@@ -1,3 +1,5 @@
+import sys
+import types
 import unittest
 from contextlib import nullcontext
 
@@ -78,14 +80,81 @@ class AnnDataIndexCheckOverrideTests(unittest.TestCase):
             pass
 
 
+class IPythonDisplayCompatibilityTests(unittest.TestCase):
+    _missing = object()
+
+    def setUp(self):
+        self.module_names = [
+            "IPython",
+            "IPython.display",
+            "matplotlib_inline",
+            "matplotlib_inline.backend_inline",
+        ]
+        self.original_modules = {
+            name: sys.modules.get(name, self._missing)
+            for name in self.module_names
+        }
+
+    def tearDown(self):
+        for name, module in self.original_modules.items():
+            if module is self._missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def test_patch_ipython_display_uses_matplotlib_inline_backend(self):
+        ipython = types.ModuleType("IPython")
+        ipython_display = types.ModuleType("IPython.display")
+        matplotlib_inline = types.ModuleType("matplotlib_inline")
+        backend_inline = types.ModuleType("matplotlib_inline.backend_inline")
+
+        def set_matplotlib_formats(*args, **kwargs):
+            return None
+
+        ipython.display = ipython_display
+        matplotlib_inline.backend_inline = backend_inline
+        backend_inline.set_matplotlib_formats = set_matplotlib_formats
+        sys.modules["IPython"] = ipython
+        sys.modules["IPython.display"] = ipython_display
+        sys.modules["matplotlib_inline"] = matplotlib_inline
+        sys.modules["matplotlib_inline.backend_inline"] = backend_inline
+
+        shared._patch_ipython_display_for_scanpy()
+
+        self.assertIs(ipython_display.set_matplotlib_formats, set_matplotlib_formats)
+
+
 class ScanpyCompatibilityTests(unittest.TestCase):
     def setUp(self):
         self.original_require_optional_dependency = shared._require_optional_dependency
         self.original_scanpy_configured = shared._SCANPY_CONFIGURED
+        self.original_patch_ipython_display = shared._patch_ipython_display_for_scanpy
 
     def tearDown(self):
         shared._require_optional_dependency = self.original_require_optional_dependency
         shared._SCANPY_CONFIGURED = self.original_scanpy_configured
+        shared._patch_ipython_display_for_scanpy = self.original_patch_ipython_display
+
+    def test_require_scanpy_patches_ipython_before_scanpy_setup(self):
+        events = []
+
+        class Settings:
+            verbosity = None
+
+        class FakeScanpy:
+            settings = Settings()
+
+            def set_figure_params(self, **kwargs):
+                events.append("set_figure_params")
+
+        fake_scanpy = FakeScanpy()
+        shared._SCANPY_CONFIGURED = False
+        shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+        shared._patch_ipython_display_for_scanpy = lambda: events.append("patch_ipython")
+
+        self.assertIs(shared._require_scanpy(), fake_scanpy)
+
+        self.assertEqual(events, ["patch_ipython", "set_figure_params"])
 
     def test_require_scanpy_disables_ipython_display_format_setup(self):
         calls = []
@@ -102,6 +171,7 @@ class ScanpyCompatibilityTests(unittest.TestCase):
         fake_scanpy = FakeScanpy()
         shared._SCANPY_CONFIGURED = False
         shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+        shared._patch_ipython_display_for_scanpy = lambda: None
 
         self.assertIs(shared._require_scanpy(), fake_scanpy)
 
@@ -127,6 +197,7 @@ class ScanpyCompatibilityTests(unittest.TestCase):
         fake_scanpy = FakeScanpy()
         shared._SCANPY_CONFIGURED = False
         shared._require_optional_dependency = lambda module_name, install_name=None: fake_scanpy
+        shared._patch_ipython_display_for_scanpy = lambda: None
 
         self.assertIs(shared._require_scanpy(), fake_scanpy)
 

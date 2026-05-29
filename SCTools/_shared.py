@@ -76,10 +76,31 @@ def _require_pegasus():
     return _require_optional_dependency("pegasus", "pegasuspy")
 
 
+def _patch_ipython_display_for_scanpy():
+    """Provide Scanpy's expected IPython display hook across IPython versions."""
+    try:
+        ipython_display = importlib.import_module("IPython.display")
+    except ImportError:
+        return
+
+    if hasattr(ipython_display, "set_matplotlib_formats"):
+        return
+
+    try:
+        backend_inline = importlib.import_module("matplotlib_inline.backend_inline")
+        set_matplotlib_formats = backend_inline.set_matplotlib_formats
+    except (AttributeError, ImportError):
+        def set_matplotlib_formats(*args, **kwargs):
+            return None
+
+    ipython_display.set_matplotlib_formats = set_matplotlib_formats
+
+
 def _require_scanpy():
     sc = _require_optional_dependency("scanpy")
     global _SCANPY_CONFIGURED
     if not _SCANPY_CONFIGURED:
+        _patch_ipython_display_for_scanpy()
         figure_params = {
             "scanpy": True,
             "dpi": 100,
