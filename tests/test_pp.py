@@ -25,9 +25,19 @@ class FakeAnnData:
     def __init__(self, owner, *, isbacked):
         self.owner = owner
         self.isbacked = isbacked
+        self.is_view = False
         self.X = "X"
         self.raw = FakeRaw()
-        self.var = pd.DataFrame(index=pd.Index(["gene1", "gene2", "gene3"]))
+        self.var = pd.DataFrame(
+            {
+                "robust_protein_coding": [True, False, True],
+                "protein_coding": [True, True, False],
+                "gene_chrom": ["1", "2", "X"],
+            },
+            index=pd.Index(["gene1", "gene2", "gene3"]),
+        )
+        if not owner.include_robust:
+            del self.var["robust_protein_coding"]
         self.uns = {"log1p": {"base": 2}, "large_uns": object()}
         self.obsm = {"X_pca": object()}
         self.varm = {"PCs": object()}
@@ -40,6 +50,26 @@ class FakeAnnData:
 
     def __repr__(self):
         return "FakeAnnData"
+
+    def __getitem__(self, index):
+        if self.isbacked and self.is_view:
+            raise ValueError("cannot index repeatedly into a backed AnnData")
+
+        _, var_index = index
+        adata = FakeAnnData(self.owner, isbacked=self.isbacked)
+        adata.is_view = True
+        adata.X = self.X
+        adata.raw = self.raw
+        adata.var = self.var.iloc[var_index].copy()
+        adata.uns = dict(self.uns)
+        adata.obsm = dict(self.obsm)
+        adata.varm = dict(self.varm)
+        adata.layers = dict(self.layers)
+        adata.obsp = dict(self.obsp)
+        adata.varp = dict(self.varp)
+        self.owner.slice_calls += 1
+        self.owner.adata_refs.append(weakref.ref(adata))
+        return adata
 
     def to_memory(self):
         adata = FakeAnnData(self.owner, isbacked=False)
@@ -61,6 +91,7 @@ class FakeScanpyPP:
         self.owner = owner
 
     def highly_variable_genes(self, adata, **kwargs):
+        highly_variable = [(idx % 2) == 0 for idx in range(len(adata.var.index))]
         self.owner.hvg_received_backed = adata.isbacked
         self.owner.hvg_received_slots = {
             "raw": adata.raw is not None,
@@ -73,7 +104,7 @@ class FakeScanpyPP:
             "varp": set(adata.varp),
         }
         return pd.DataFrame(
-            {"highly_variable": [True, False, True]},
+            {"highly_variable": highly_variable},
             index=adata.var.index,
         )
 
@@ -95,8 +126,10 @@ class FakeScanpy:
         self.files = []
         self.hvg_received_backed = None
         self.hvg_received_slots = None
+        self.include_robust = True
         self.plot_calls = 0
         self.read_kwargs = None
+        self.slice_calls = 0
 
     def read_h5ad(self, h5ad_file, **kwargs):
         self.read_kwargs = kwargs
@@ -164,6 +197,17 @@ class ScanpyHVFH5ADMemoryTests(unittest.TestCase):
         gc.collect()
         self.assertTrue(all(ref() is None for ref in self.scanpy.adata_refs))
 
+    def test_scanpy_hvf_h5ad_combines_filters_before_backed_slice(self):
+        features = pp.scanpy_hvf_h5ad(
+            "input.h5ad",
+            robust_protein_coding=True,
+            protein_coding=True,
+            autosome=True,
+        )
+
+        self.assertEqual(features, ["gene1"])
+        self.assertEqual(self.scanpy.slice_calls, 1)
+
     def test_scanpy_hvf_h5ad_plots_when_requested(self):
         features = pp.scanpy_hvf_h5ad("input.h5ad", plot=True)
 
@@ -192,6 +236,8 @@ class ScanpyHVFH5ADMemoryTests(unittest.TestCase):
         self.assertTrue(all(file.closed for file in self.scanpy.files))
 
     def test_scanpy_hvf_h5ad_clears_anndata_from_traceback_on_error(self):
+        self.scanpy.include_robust = False
+
         with self.assertRaises(KeyError) as caught:
             pp.scanpy_hvf_h5ad("input.h5ad", robust_protein_coding=True)
 

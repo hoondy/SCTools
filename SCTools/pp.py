@@ -93,6 +93,26 @@ def _drop_scanpy_hvf_h5ad_unused_slots(adata, *, keep_raw):
         getattr(adata, attr).clear()
 
 
+def _scanpy_hvf_h5ad_var_mask(adata, *, robust_protein_coding, protein_coding, autosome):
+    var_mask = None
+
+    if robust_protein_coding:
+        print("subset robust_protein_coding")
+        if "robust_protein_coding" not in adata.var:
+            raise KeyError("Expected `robust_protein_coding` in `.var`.")
+        var_mask = adata.var["robust_protein_coding"].astype(bool).to_numpy()
+
+    if protein_coding:
+        protein_coding_mask = _get_protein_coding_mask(adata.var)
+        var_mask = protein_coding_mask if var_mask is None else var_mask & protein_coding_mask
+
+    if autosome:
+        autosome_mask = _get_autosome_mask(adata.var)
+        var_mask = autosome_mask if var_mask is None else var_mask & autosome_mask
+
+    return var_mask
+
+
 def scanpy_hvf_h5ad(
     h5ad_file,
     flavor="cell_ranger",
@@ -118,17 +138,14 @@ def scanpy_hvf_h5ad(
         print(adata)
         _drop_scanpy_hvf_h5ad_unused_slots(adata, keep_raw=flavor == "seurat_v3")
 
-        if robust_protein_coding:
-            print("subset robust_protein_coding")
-            if "robust_protein_coding" not in adata.var:
-                raise KeyError("Expected `robust_protein_coding` in `.var`.")
-            adata = adata[:, adata.var.robust_protein_coding]
-
-        if protein_coding:
-            adata = adata[:, _get_protein_coding_mask(adata.var)]
-
-        if autosome:
-            adata = adata[:, _get_autosome_mask(adata.var)]
+        var_mask = _scanpy_hvf_h5ad_var_mask(
+            adata,
+            robust_protein_coding=robust_protein_coding,
+            protein_coding=protein_coding,
+            autosome=autosome,
+        )
+        if var_mask is not None:
+            adata = adata[:, var_mask]
 
         if flavor == "seurat_v3":
             _require_raw(adata, context="`scanpy_hvf_h5ad(..., flavor='seurat_v3')`")
