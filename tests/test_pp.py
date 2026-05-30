@@ -1,8 +1,12 @@
 import gc
+import tempfile
 import unittest
 import weakref
 
+import anndata as ad
+import numpy as np
 import pandas as pd
+from scipy import sparse
 
 import SCTools.pp as pp
 
@@ -150,12 +154,24 @@ class FakePegasusData:
 
 class ScanpyHVFH5ADMemoryTests(unittest.TestCase):
     def setUp(self):
+        def fake_materialize(h5ad_file, backed_adata, var_mask, *, use_raw):
+            if var_mask is not None:
+                backed_adata = backed_adata[:, var_mask]
+            adata = backed_adata.to_memory()
+            if use_raw:
+                adata.X = adata.raw.X
+            adata.raw = None
+            return adata
+
         self.original_require_scanpy = pp._require_scanpy
+        self.original_materialize = pp._materialize_scanpy_hvf_h5ad
         self.scanpy = FakeScanpy()
         pp._require_scanpy = lambda: self.scanpy
+        pp._materialize_scanpy_hvf_h5ad = fake_materialize
 
     def tearDown(self):
         pp._require_scanpy = self.original_require_scanpy
+        pp._materialize_scanpy_hvf_h5ad = self.original_materialize
 
     def test_scanpy_hvf_does_not_plot_by_default(self):
         data = FakePegasusData(self.scanpy)
@@ -207,6 +223,55 @@ class ScanpyHVFH5ADMemoryTests(unittest.TestCase):
 
         self.assertEqual(features, ["gene1"])
         self.assertEqual(self.scanpy.slice_calls, 1)
+
+    def test_materialize_scanpy_hvf_h5ad_reads_selected_csr_without_backed_view(self):
+        pp._materialize_scanpy_hvf_h5ad = self.original_materialize
+        with tempfile.NamedTemporaryFile(suffix=".h5ad") as tmp:
+            source = ad.AnnData(
+                sparse.csr_matrix(
+                    np.array(
+                        [
+                            [1.0, 0.0, 2.0],
+                            [0.0, 3.0, 0.0],
+                            [4.0, 0.0, 5.0],
+                        ],
+                        dtype=np.float32,
+                    )
+                ),
+                obs=pd.DataFrame({"batch": ["a", "b", "a"]}, index=["cell1", "cell2", "cell3"]),
+                var=pd.DataFrame(
+                    {
+                        "robust_protein_coding": [True, False, True],
+                        "protein_coding": [True, True, False],
+                        "gene_chrom": ["1", "2", "X"],
+                    },
+                    index=["gene1", "gene2", "gene3"],
+                ),
+                uns={"log1p": {"base": 2}, "large_uns": np.ones((3, 3))},
+                obsm={"X_pca": np.ones((3, 2))},
+            )
+            source.write_h5ad(tmp.name)
+
+            backed = ad.read_h5ad(tmp.name, backed="r")
+            pp._drop_scanpy_hvf_h5ad_unused_slots(backed, keep_raw=False)
+            var_mask = pp._scanpy_hvf_h5ad_var_mask(
+                backed,
+                robust_protein_coding=True,
+                protein_coding=False,
+                autosome=False,
+            )
+
+            materialized = pp._materialize_scanpy_hvf_h5ad(tmp.name, backed, var_mask, use_raw=False)
+            backed.file.close()
+
+        self.assertFalse(materialized.isbacked)
+        self.assertEqual(materialized.var_names.tolist(), ["gene1", "gene3"])
+        self.assertEqual(set(materialized.uns), {"log1p"})
+        self.assertEqual(list(materialized.obsm.keys()), [])
+        np.testing.assert_array_equal(
+            materialized.X.toarray(),
+            np.array([[1.0, 2.0], [0.0, 0.0], [4.0, 5.0]], dtype=np.float32),
+        )
 
     def test_scanpy_hvf_h5ad_plots_when_requested(self):
         features = pp.scanpy_hvf_h5ad("input.h5ad", plot=True)

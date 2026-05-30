@@ -4,13 +4,18 @@ from ._shared import (
     _LEGACY_MITOCARTA_PATH,
     _get_autosome_mask,
     _get_protein_coding_mask,
+    _matrix_shape,
     _require_pegasus,
     _require_raw,
     _require_scanpy,
+    ad,
     clean_unused_categories,
     gc,
+    h5py,
     np,
     pd,
+    read_elem,
+    sparse,
     stats,
 )
 
@@ -113,6 +118,118 @@ def _scanpy_hvf_h5ad_var_mask(adata, *, robust_protein_coding, protein_coding, a
     return var_mask
 
 
+def _h5ad_matrix_encoding(node):
+    if isinstance(node, h5py.Dataset):
+        return "array"
+    encoding = node.attrs.get("encoding-type")
+    if isinstance(encoding, bytes):
+        encoding = encoding.decode()
+    return encoding
+
+
+def _read_csr_matrix_subset(group, var_idx, chunk_size=500000):
+    n_obs, n_vars = _matrix_shape(group)
+    if var_idx is None:
+        return sparse.csr_matrix(
+            (group["data"][:], group["indices"][:], group["indptr"][:]),
+            shape=(n_obs, n_vars),
+        )
+
+    chunks = []
+    csr_indptr = group["indptr"][:]
+    for row_start in range(0, n_obs, chunk_size):
+        row_end = min(row_start + chunk_size, n_obs)
+        tmp_indptr = csr_indptr[row_start : row_end + 1]
+        tmp_csr = sparse.csr_matrix(
+            (
+                group["data"][tmp_indptr[0] : tmp_indptr[-1]],
+                group["indices"][tmp_indptr[0] : tmp_indptr[-1]],
+                tmp_indptr - tmp_indptr[0],
+            ),
+            shape=(row_end - row_start, n_vars),
+        )
+        chunks.append(tmp_csr[:, var_idx])
+
+    if not chunks:
+        return sparse.csr_matrix((0, len(var_idx)))
+    return sparse.vstack(chunks, format="csr")
+
+
+def _read_csc_matrix_subset(group, var_idx):
+    n_obs, n_vars = _matrix_shape(group)
+    if var_idx is None:
+        return sparse.csc_matrix(
+            (group["data"][:], group["indices"][:], group["indptr"][:]),
+            shape=(n_obs, n_vars),
+        ).tocsr()
+
+    src_indptr = group["indptr"]
+    data_parts = []
+    indices_parts = []
+    new_indptr = [0]
+    for col_idx in var_idx:
+        start, end = src_indptr[col_idx], src_indptr[col_idx + 1]
+        data_parts.append(group["data"][start:end])
+        indices_parts.append(group["indices"][start:end])
+        new_indptr.append(new_indptr[-1] + end - start)
+
+    data = np.concatenate(data_parts) if data_parts else np.array([], dtype=group["data"].dtype)
+    indices = np.concatenate(indices_parts) if indices_parts else np.array([], dtype=group["indices"].dtype)
+    return sparse.csc_matrix(
+        (data, indices, np.asarray(new_indptr, dtype=group["indptr"].dtype)),
+        shape=(n_obs, len(var_idx)),
+    ).tocsr()
+
+
+def _read_h5ad_matrix_subset(node, var_idx):
+    encoding = _h5ad_matrix_encoding(node)
+    if encoding == "array":
+        return node[:, :] if var_idx is None else node[:, var_idx]
+    if encoding == "csr_matrix":
+        return _read_csr_matrix_subset(node, var_idx)
+    if encoding == "csc_matrix":
+        return _read_csc_matrix_subset(node, var_idx)
+    raise ValueError(f"Unsupported H5AD matrix encoding for HVG selection: {encoding!r}.")
+
+
+def _raw_var_index_for_hvf(handle, selected_var_names, fallback_var_idx, n_vars):
+    raw = handle["raw"]
+    raw_x = raw["X"]
+    raw_n_vars = raw_x.shape[1] if isinstance(raw_x, h5py.Dataset) else _matrix_shape(raw_x)[1]
+
+    if "var" in raw:
+        raw_var = read_elem(raw["var"])
+        raw_idx = raw_var.index.get_indexer(selected_var_names)
+        if np.all(raw_idx >= 0):
+            return raw_idx
+
+    if fallback_var_idx is None:
+        return None
+    if raw_n_vars == n_vars:
+        return fallback_var_idx
+    if raw_n_vars == len(selected_var_names):
+        return None
+    raise ValueError("Could not align selected `.var` genes with `raw/X` for `flavor='seurat_v3'`.")
+
+
+def _materialize_scanpy_hvf_h5ad(h5ad_file, backed_adata, var_mask, *, use_raw):
+    var_idx = None if var_mask is None else np.flatnonzero(var_mask)
+    obs = backed_adata.obs.copy()
+    var = backed_adata.var.copy() if var_idx is None else backed_adata.var.iloc[var_idx].copy()
+    uns = dict(backed_adata.uns)
+
+    with h5py.File(h5ad_file, "r") as handle:
+        if use_raw:
+            matrix_var_idx = _raw_var_index_for_hvf(handle, var.index, var_idx, backed_adata.n_vars)
+            x_node = handle["raw/X"]
+        else:
+            matrix_var_idx = var_idx
+            x_node = handle["X"]
+        x = _read_h5ad_matrix_subset(x_node, matrix_var_idx)
+
+    return ad.AnnData(x, obs=obs, var=var, uns=uns)
+
+
 def scanpy_hvf_h5ad(
     h5ad_file,
     flavor="cell_ranger",
@@ -144,17 +261,13 @@ def scanpy_hvf_h5ad(
             protein_coding=protein_coding,
             autosome=autosome,
         )
-        if var_mask is not None:
-            adata = adata[:, var_mask]
 
         if flavor == "seurat_v3":
             _require_raw(adata, context="`scanpy_hvf_h5ad(..., flavor='seurat_v3')`")
 
-        adata = adata.to_memory()
+        adata = _materialize_scanpy_hvf_h5ad(h5ad_file, adata, var_mask, use_raw=flavor == "seurat_v3")
 
         if flavor == "seurat_v3":
-            adata.X = adata.raw.X
-            adata.raw = None
             if n_top_genes is None:
                 raise ValueError("`n_top_genes` is mandatory if `flavor` is `seurat_v3`.")
 
