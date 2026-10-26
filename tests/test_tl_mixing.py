@@ -67,7 +67,7 @@ def _make_adata(n_pure=150, n_doublet=25, n_ambient=25, n_opc_oligo=25, seed=0):
 
 
 class DetectLineageMixingTests(unittest.TestCase):
-    def test_doublets_are_flagged_with_foreign_type(self):
+    def test_doublets_are_flagged_with_top_foreign_group(self):
         adata = _make_adata()
 
         summary = sct.tl.detect_lineage_mixing(
@@ -78,14 +78,14 @@ class DetectLineageMixingTests(unittest.TestCase):
         flag = adata.obs["mixing_flag"].astype(bool)
         self.assertGreaterEqual(flag[kind == "doublet"].mean(), 0.95)
         self.assertLessEqual(flag[kind == "pure"].mean(), 0.02)
-        foreign_types = adata.obs.loc[kind == "doublet", "mixing_foreign_type"]
+        foreign_types = adata.obs.loc[kind == "doublet", "mixing_top"]
         self.assertGreaterEqual((foreign_types == "EN").mean(), 0.9)
         self.assertEqual(adata.obsm["mixing_weights"].shape, (adata.n_obs, len(GROUPS)))
         self.assertIn("group_summary", adata.uns["mixing"])
         self.assertListEqual(
-            list(summary.columns), ["group", "n_cells", "median_foreign_umi", "n_flagged", "flag_fraction", "top_foreign_type"]
+            list(summary.columns), ["group", "n_cells", "median_UMI_frac", "n_flagged", "flag_fraction", "top"]
         )
-        self.assertEqual(summary.set_index("group").loc["Astro", "top_foreign_type"], "EN")
+        self.assertEqual(summary.set_index("group").loc["Astro", "top"], "EN")
 
     def test_doublet_vs_ambient_source(self):
         adata = _make_adata()
@@ -101,10 +101,10 @@ class DetectLineageMixingTests(unittest.TestCase):
         self.assertGreater(len(ambient_source), 0)
         self.assertGreaterEqual((doublet_source == "doublet").mean(), 0.9)
         self.assertGreaterEqual((ambient_source == "ambient").mean(), 0.9)
-        self.assertTrue(obs.loc[obs["mixing_flag"] == 0, "mixing_doublet_llr"].isna().all())
+        self.assertTrue(obs.loc[obs["mixing_flag"] == 0, "mixing_doublet_logLR"].isna().all())
         self.assertIn("library_summary", adata.uns["mixing"])
 
-    def test_merge_lineages_protects_transition_states(self):
+    def test_known_lineage_sets_protects_transition_states(self):
         adata = _make_adata()
         transition = adata.obs["kind"] == "opc_oligo"
 
@@ -112,7 +112,7 @@ class DetectLineageMixingTests(unittest.TestCase):
         self.assertGreaterEqual(adata.obs.loc[transition, "mixing_flag"].mean(), 0.9)
 
         sct.tl.detect_lineage_mixing(
-            adata, lineage_key="class", merge_lineages=[("OPC", "Oligo")], use_raw=False, n_markers=20
+            adata, lineage_key="class", known_lineage_sets=[("OPC", "Oligo")], use_raw=False, n_markers=20
         )
         self.assertEqual(int(adata.obs.loc[transition, "mixing_flag"].sum()), 0)
 
@@ -127,7 +127,7 @@ class DetectLineageMixingTests(unittest.TestCase):
             adata, lineage_key="class", layer="counts_csc", n_markers=20, chunk_size=37, key_added="stream", **converge
         )
 
-        np.testing.assert_allclose(adata.obs["mem_foreign_umi"], adata.obs["stream_foreign_umi"], atol=1e-3)
+        np.testing.assert_allclose(adata.obs["mem_UMI_frac"], adata.obs["stream_UMI_frac"], atol=1e-3)
 
     def test_small_groups_are_left_unscored(self):
         adata = _make_adata(n_pure=60, n_doublet=0, n_ambient=0, n_opc_oligo=0)
@@ -139,7 +139,7 @@ class DetectLineageMixingTests(unittest.TestCase):
         sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False, n_markers=20, min_group_size=20)
 
         rare = adata.obs["subclass"] == "Rare"
-        self.assertTrue(adata.obs.loc[rare, "mixing_foreign_umi"].isna().all())
+        self.assertTrue(adata.obs.loc[rare, "mixing_UMI_frac"].isna().all())
         self.assertEqual(int(adata.obs.loc[rare, "mixing_flag"].sum()), 0)
 
     def test_rejects_normalized_matrix(self):
@@ -151,12 +151,12 @@ class DetectLineageMixingTests(unittest.TestCase):
             sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False)
 
 
-    def test_merge_lineages_rejects_unknown_labels(self):
+    def test_known_lineage_sets_rejects_unknown_labels(self):
         adata = _make_adata(n_pure=30, n_doublet=0, n_ambient=0, n_opc_oligo=0)
 
         with self.assertRaises(KeyError):
             sct.tl.detect_lineage_mixing(
-                adata, lineage_key="class", merge_lineages=[("OPC", "Oligodendrocyte")], use_raw=False
+                adata, lineage_key="class", known_lineage_sets=[("OPC", "Oligodendrocyte")], use_raw=False
             )
 
     def test_results_write_to_h5ad(self):

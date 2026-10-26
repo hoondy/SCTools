@@ -1052,7 +1052,7 @@ def detect_lineage_mixing(
     adata: ad.AnnData,
     groupby: str = "subclass",
     lineage_key: str = None,
-    merge_lineages=None,
+    known_lineage_sets=None,
     layer: str = None,
     use_raw: bool = None,
     library_key: str = None,
@@ -1111,12 +1111,13 @@ def detect_lineage_mixing(
         (e.g. ``"class"``). Mixing between groups of the same lineage is not
         counted as foreign. Defaults to ``groupby``, so every group is its own
         lineage.
-    merge_lineages
-        Lineages to treat as one, as a list of label collections, e.g.
-        ``[("OPC", "Oligo")]``. Use this when cells transitioning between
-        lineages are expected (such as differentiating OPCs) so they are not
-        flagged; mixtures across merged lineages are then no longer detected.
-        Labels may be ``lineage_key`` values or ``groupby`` labels.
+    known_lineage_sets
+        Sets of lineages known to be connected, each treated as one lineage,
+        given as a list of label collections, e.g. ``[("OPC", "Oligo")]``. Use
+        this when cells transitioning between lineages are expected (such as
+        differentiating OPCs) so they are not flagged; mixtures within a set are
+        then no longer detected. Labels may be ``lineage_key`` values or
+        ``groupby`` labels.
     library_key
         ``.obs`` column identifying each cell's sequencing library (e.g. 10x
         channel). Cells of one library share one ambient RNA pool, so pass the
@@ -1124,7 +1125,7 @@ def detect_lineage_mixing(
         change the foreign score or the flag, but enables the doublet/ambient
         classification and a per-library summary.
     threshold
-        Cells with ``{key_added}_foreign_umi >= threshold`` are flagged.
+        Cells with ``{key_added}_UMI_frac >= threshold`` are flagged.
     summary_by
         ``.obs`` column(s) for the returned summary; defaults to ``groupby``. Use a
         finer label such as ``"subtype"`` to find whole clusters to drop.
@@ -1142,15 +1143,15 @@ def detect_lineage_mixing(
     ------
     ``adata.obs``:
 
-    - ``{key_added}_foreign_umi``: fraction of the cell's marker-panel UMIs
+    - ``{key_added}_UMI_frac``: fraction of the cell's marker-panel UMIs
       attributed to other lineages; the score used for flagging.
-    - ``{key_added}_foreign_rna``: the same converted to an estimated fraction of
+    - ``{key_added}_RNA_frac``: the same converted to an estimated fraction of
       the cell's total RNA, using each profile's typical panel share.
-    - ``{key_added}_foreign_type`` and ``{key_added}_foreign_type_umi``: the
+    - ``{key_added}_top`` and ``{key_added}_top_weight``: the
       foreign group with the largest weight, and that weight.
     - ``{key_added}_flag``: 1 if flagged, else 0.
     - With ``library_key``, for flagged cells: ``{key_added}_source``
-      (``"doublet"`` or ``"ambient"``) and ``{key_added}_doublet_llr``, the
+      (``"doublet"`` or ``"ambient"``) and ``{key_added}_doublet_logLR``, the
       log-likelihood ratio behind it (positive favours ``"doublet"``).
 
     ``adata.obsm[f"{key_added}_weights"]``: per-cell weights over groups.
@@ -1189,12 +1190,12 @@ def detect_lineage_mixing(
         if group in lineage_of_group and lineage_of_group[group] != lineage:
             raise ValueError(f"Group {group!r} maps to more than one `{lineage_key}` value.")
         lineage_of_group[group] = lineage
-    for merged in merge_lineages or []:
+    for merged in known_lineage_sets or []:
         merged = [str(label) for label in merged]
         known = {str(g) for g in lineage_of_group} | set(lineage_of_group.values())
         unknown = sorted(set(merged) - known)
         if unknown:
-            raise KeyError(f"`merge_lineages` labels not found as groups or lineages: {unknown}.")
+            raise KeyError(f"`known_lineage_sets` labels not found as groups or lineages: {unknown}.")
         merged_name = "+".join(merged)
         lineage_of_group = {
             g: merged_name if (str(g) in merged or lin in merged) else lin for g, lin in lineage_of_group.items()
@@ -1300,11 +1301,11 @@ def detect_lineage_mixing(
     scored = codes >= 0
     own_mask = np.zeros((n_obs, n_groups), dtype=bool)
     own_mask[scored] = group_lineage[None, :] == cell_lineage[scored, None]
-    foreign_umi = np.where(scored, 1 - (W * own_mask).sum(1), np.nan)
+    umi_frac = np.where(scored, 1 - (W * own_mask).sum(1), np.nan)
     foreign_weights = np.where(own_mask, -1.0, W)
-    foreign_type_idx = foreign_weights.argmax(1)
-    foreign_type_umi = np.where(scored, foreign_weights.max(1), np.nan)
-    foreign_type = pd.Categorical(np.where(scored, groups[foreign_type_idx], None), categories=groups)
+    top_idx = foreign_weights.argmax(1)
+    top_weight = np.where(scored, foreign_weights.max(1), np.nan)
+    top = pd.Categorical(np.where(scored, groups[top_idx], None), categories=groups)
 
     # convert panel-UMI weights to total-RNA fractions with each profile's panel share
     core_cells = ref_idx[core >= 0]
@@ -1313,12 +1314,12 @@ def detect_lineage_mixing(
     )
     rna = W / np.maximum(profile_panel_fraction, 1e-9)
     rna /= rna.sum(1, keepdims=True)
-    foreign_rna = np.where(scored, 1 - (rna * own_mask).sum(1), np.nan)
+    rna_frac = np.where(scored, 1 - (rna * own_mask).sum(1), np.nan)
 
-    flag = scored & (foreign_umi >= threshold)
+    flag = scored & (umi_frac >= threshold)
 
     # ---- doublet-like (one foreign type) vs ambient-like (library pool) foreign signal ----
-    llr = np.full(n_obs, np.nan)
+    log_lr = np.full(n_obs, np.nan)
     source = np.full(n_obs, None, dtype=object)
     if library_key is not None and flag.any():
         libraries = adata.obs[library_key].astype("category")
@@ -1335,29 +1336,29 @@ def detect_lineage_mixing(
             idx = np.where(testable & (cell_lineage == lin))[0]
             own_profiles = P[group_lineage == lin]
             _, ll_doublet = _fit_mixture_weights(
-                Xp[idx], own_profiles, max_iter, tol, chunk_size, extra=P, extra_index=foreign_type_idx[idx]
+                Xp[idx], own_profiles, max_iter, tol, chunk_size, extra=P, extra_index=top_idx[idx]
             )
             _, ll_ambient = _fit_mixture_weights(
                 Xp[idx], own_profiles, max_iter, tol, chunk_size, extra=ambient, extra_index=library_codes[idx]
             )
-            llr[idx] = ll_doublet - ll_ambient
-        has_llr = ~np.isnan(llr)
-        source[has_llr] = np.where(llr[has_llr] > 0, "doublet", "ambient")
+            log_lr[idx] = ll_doublet - ll_ambient
+        has_log_lr = ~np.isnan(log_lr)
+        source[has_log_lr] = np.where(log_lr[has_log_lr] > 0, "doublet", "ambient")
 
     # ---- write outputs ----
-    adata.obs[f"{key_added}_foreign_umi"] = foreign_umi.astype(np.float32)
-    adata.obs[f"{key_added}_foreign_rna"] = foreign_rna.astype(np.float32)
-    adata.obs[f"{key_added}_foreign_type"] = foreign_type
-    adata.obs[f"{key_added}_foreign_type_umi"] = foreign_type_umi.astype(np.float32)
+    adata.obs[f"{key_added}_UMI_frac"] = umi_frac.astype(np.float32)
+    adata.obs[f"{key_added}_RNA_frac"] = rna_frac.astype(np.float32)
+    adata.obs[f"{key_added}_top"] = top
+    adata.obs[f"{key_added}_top_weight"] = top_weight.astype(np.float32)
     adata.obs[f"{key_added}_flag"] = flag.astype(int)
     if library_key is not None:
         adata.obs[f"{key_added}_source"] = pd.Categorical(source, categories=["doublet", "ambient"])
-        adata.obs[f"{key_added}_doublet_llr"] = llr.astype(np.float32)
+        adata.obs[f"{key_added}_doublet_logLR"] = log_lr.astype(np.float32)
     adata.obsm[f"{key_added}_weights"] = W.astype(np.float32)
 
     summary_by = groupby if summary_by is None else summary_by
     frame = pd.DataFrame(
-        {"foreign_umi": foreign_umi, "flag": flag, "foreign_type": foreign_type.astype(object), "source": source},
+        {"umi_frac": umi_frac, "flag": flag, "top": top.astype(object), "source": source},
         index=adata.obs.index,
     )
     rows = []
@@ -1367,16 +1368,16 @@ def detect_lineage_mixing(
         row = {
             "group": group_name,
             "n_cells": int(len(sub)),
-            "median_foreign_umi": float(sub["foreign_umi"].median()),
+            "median_UMI_frac": float(sub["umi_frac"].median()),
             "n_flagged": int(len(flagged)),
             "flag_fraction": float(sub["flag"].mean()) if len(sub) else np.nan,
-            "top_foreign_type": flagged["foreign_type"].mode().iloc[0] if len(flagged) else None,
+            "top": flagged["top"].mode().iloc[0] if len(flagged) else None,
         }
         if library_key is not None:
             row["doublet_fraction"] = float((flagged["source"] == "doublet").mean()) if len(flagged) else np.nan
         rows.append(row)
     summary = pd.DataFrame(rows)
-    summary["top_foreign_type"] = summary["top_foreign_type"].astype("category")
+    summary["top"] = summary["top"].astype("category")
 
     library_summary = None
     if library_key is not None:
@@ -1384,10 +1385,10 @@ def detect_lineage_mixing(
         library_summary = library_frame.groupby("library").agg(
             n_cells=("flag", "size"),
             flag_fraction=("flag", "mean"),
-            median_foreign_umi=("foreign_umi", "median"),
+            median_UMI_frac=("umi_frac", "median"),
         )
-        library_summary["median_foreign_umi_unflagged"] = (
-            library_frame[~library_frame["flag"]].groupby("library")["foreign_umi"].median()
+        library_summary["median_UMI_frac_unflagged"] = (
+            library_frame[~library_frame["flag"]].groupby("library")["umi_frac"].median()
         )
         library_summary = library_summary.reset_index()
 

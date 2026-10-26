@@ -215,21 +215,24 @@ adata = ad.read_h5ad("data.h5ad", backed="r")   # counts are streamed from raw.X
 
 summary = sct.tl.detect_lineage_mixing(
     adata,
-    groupby="subclass",                   # mixture components
-    lineage_key="class",                  # mixing within a lineage is not foreign
-    merge_lineages=[("OPC", "Oligo")],    # optional: allow OPC -> oligodendrocyte transitions
-    library_key="library_id",             # optional: sequencing library / 10x channel
-    summary_by="subtype",                 # optional: summarize at a finer level
+    groupby="subclass",                     # mixture components
+    lineage_key="class",                    # mixing within a lineage is not foreign
+    known_lineage_sets=[("OPC", "Oligo")],  # optional: allow OPC -> oligodendrocyte transitions
+    library_key="library_id",               # optional: sequencing library / 10x channel
+    summary_by="subtype",                   # optional: summarize at a finer level
     threshold=0.3,
 )
 
-# adata.obs["mixing_foreign_umi"]  -> fraction of marker-panel UMIs from other lineages
-# adata.obs["mixing_foreign_rna"]  -> the same as an estimated fraction of total RNA
-# adata.obs["mixing_foreign_type"] -> foreign cell type with the largest weight
-# adata.obs["mixing_flag"]         -> 1 if mixing_foreign_umi >= threshold, else 0
-# adata.obs["mixing_source"]       -> for flagged cells: "doublet" or "ambient"
-# adata.obsm["mixing_weights"]     -> per-cell weights over all groups
-# summary                          -> per-group flagged fraction and top foreign type
+# adata.obs["mixing_UMI_frac"]    -> fraction of marker-panel UMIs from other lineages
+# adata.obs["mixing_RNA_frac"]    -> the same as an estimated fraction of total RNA
+# adata.obs["mixing_top"]         -> foreign cell type with the largest weight
+# adata.obs["mixing_top_weight"]  -> that cell type's weight
+# adata.obs["mixing_flag"]        -> 1 if mixing_UMI_frac >= threshold, else 0
+# adata.obs["mixing_source"]      -> for flagged cells: "doublet" or "ambient"
+# adata.obsm["mixing_weights"]    -> per-cell weights over all groups
+# summary                         -> per-group flagged fraction and top foreign type
+
+adata = adata[adata.obs["mixing_flag"] == 0]  # remove flagged cells
 ```
 
 Parameters that need a decision:
@@ -237,7 +240,7 @@ Parameters that need a decision:
 - `lineage_key` assigns each `groupby` label to a broader lineage. Weight on
   other groups of the same lineage (e.g. two excitatory neuron subclasses) is
   not counted as foreign. If omitted, every group is its own lineage.
-- `merge_lineages` treats the listed lineages as one. Use it when real cells
+- `known_lineage_sets` treats the listed lineages as one. Use it when real cells
   sit between two lineages, such as differentiating oligodendrocyte precursors,
   so they are not flagged. Mixtures across merged lineages are then no longer
   detected. Labels may be lineage or group labels; unknown labels raise an
@@ -259,7 +262,7 @@ Notes:
 - Use a coarse `groupby` such as subclass. If a contaminated population is its
   own group, its profile absorbs the contamination and it cannot be detected.
 - The score distribution is usually bimodal, with clean cells near 0 and
-  mixtures well above. Check a histogram of `mixing_foreign_umi` per group
+  mixtures well above. Check a histogram of `mixing_UMI_frac` per group
   before relying on the default `threshold=0.3`.
 - Review `summary` at a finer level such as subtype. A subcluster with a
   consistent foreign type and a high flagged fraction is often better removed
