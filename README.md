@@ -220,7 +220,7 @@ summary = sct.tl.detect_lineage_mixing(
     known_lineage_sets=[("OPC", "Oligo")],  # optional: allow OPC -> oligodendrocyte transitions
     library_key="library_id",               # optional: sequencing library / 10x channel
     summary_by="subtype",                   # optional: summarize at a finer level
-    threshold=0.3,
+    threshold=0.4,
 )
 
 # adata.obs["mixing_UMI_frac"]    -> fraction of marker-panel UMIs from other lineages
@@ -263,7 +263,7 @@ Notes:
   own group, its profile absorbs the contamination and it cannot be detected.
 - The score distribution is usually bimodal, with clean cells near 0 and
   mixtures well above. Check a histogram of `mixing_UMI_frac` per group
-  before relying on the default `threshold=0.3`.
+  before relying on the default `threshold=0.4`.
 - Review `summary` at a finer level such as subtype. A subcluster with a
   consistent foreign type and a high flagged fraction is often better removed
   as a whole than cell by cell.

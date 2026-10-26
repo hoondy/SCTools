@@ -44,7 +44,7 @@ def _make_adata(n_pure=150, n_doublet=25, n_ambient=25, n_opc_oligo=25, seed=0):
         labels.append("Astro")
         kinds.append("doublet")
     for _ in range(n_ambient):
-        rows.append(draw(0.55 * profiles["Astro"] + 0.45 * pooled, 2500))
+        rows.append(draw(0.4 * profiles["Astro"] + 0.6 * pooled, 2500))
         labels.append("Astro")
         kinds.append("ambient")
     for _ in range(n_opc_oligo):

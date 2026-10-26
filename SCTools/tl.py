@@ -1056,7 +1056,7 @@ def detect_lineage_mixing(
     layer: str = None,
     use_raw: bool = None,
     library_key: str = None,
-    threshold: float = 0.3,
+    threshold: float = 0.4,
     summary_by=None,
     n_markers: int = 150,
     min_lfc: float = 1.0,
