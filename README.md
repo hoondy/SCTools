@@ -37,7 +37,7 @@ pip install pegasuspy scanpy scikit-learn seaborn matplotlib adjustText numpy-gr
 
 - `sct.io`: `read_everything_but_X`, `csc2csr_on_disk`, `concat_on_disk`, `ondisk_subset`, `write_h5ad_with_new_annotation`, `proc_h5ad_v2`, `proc_h5ad_v3`, `proc_manifest`, and `save`
 - `sct.pp`: preprocessing helpers such as HVG selection, PCA, QC boundaries, signature scores, and category cleanup
-- `sct.tl`: aggregation, similarity, marker, PLS, outlier detection, and pseudometacell helpers
+- `sct.tl`: aggregation, similarity, marker, PLS, outlier detection, lineage-mixing (doublet/contamination) detection, and pseudometacell helpers
 - `sct.pl`: scree plots, correlation plots, palettes, and Sankey diagrams
 
 Functions are intentionally namespaced. Use `sct.io.read_everything_but_X(...)` rather than `sct.read_everything_but_X(...)`.
@@ -190,6 +190,80 @@ summary = sct.tl.detect_outliers(
 For production filtering, prefer a biologically meaningful integrated/PCA
 representation when available; UMAP is useful for catching visually obvious
 embedding islands, but its local distances are not calibrated across the map.
+
+## Lineage-mixing detection (heterotypic doublets and contamination)
+
+`sct.tl.detect_lineage_mixing` flags cells whose counts are a mixture of cell
+types from different lineages, for example a glial nucleus carrying neuronal
+transcripts. Such cells can pass simulation-based doublet scores when they are
+common enough to form their own clusters, and they then look like distinct
+subtypes.
+
+Each cell's raw counts over a marker panel are modelled as a multinomial
+mixture of fixed reference profiles (one per `groupby` label), fitted per cell
+by EM. The foreign score is the fraction of the cell's marker-panel UMIs
+attributed to profiles outside its own lineage. Clean cells score near 0, and
+a doublet of two cells with similar panel depth scores around 0.5. Mixtures
+dominated by the foreign cell type score higher. References are refined on the
+purest cells of each group, so a contaminated minority does not leak into them.
+
+```python
+import anndata as ad
+import SCTools as sct
+
+adata = ad.read_h5ad("data.h5ad", backed="r")   # counts are streamed from raw.X
+
+summary = sct.tl.detect_lineage_mixing(
+    adata,
+    groupby="subclass",                   # mixture components
+    lineage_key="class",                  # mixing within a lineage is not foreign
+    merge_lineages=[("OPC", "Oligo")],    # optional: allow OPC -> oligodendrocyte transitions
+    library_key="library_id",             # optional: sequencing library / 10x channel
+    summary_by="subtype",                 # optional: summarize at a finer level
+    threshold=0.3,
+)
+
+# adata.obs["mixing_foreign_umi"]  -> fraction of marker-panel UMIs from other lineages
+# adata.obs["mixing_foreign_rna"]  -> the same as an estimated fraction of total RNA
+# adata.obs["mixing_foreign_type"] -> foreign cell type with the largest weight
+# adata.obs["mixing_flag"]         -> 1 if mixing_foreign_umi >= threshold, else 0
+# adata.obs["mixing_source"]       -> for flagged cells: "doublet" or "ambient"
+# adata.obsm["mixing_weights"]     -> per-cell weights over all groups
+# summary                          -> per-group flagged fraction and top foreign type
+```
+
+Parameters that need a decision:
+
+- `lineage_key` assigns each `groupby` label to a broader lineage. Weight on
+  other groups of the same lineage (e.g. two excitatory neuron subclasses) is
+  not counted as foreign. If omitted, every group is its own lineage.
+- `merge_lineages` treats the listed lineages as one. Use it when real cells
+  sit between two lineages, such as differentiating oligodendrocyte precursors,
+  so they are not flagged. Mixtures across merged lineages are then no longer
+  detected. Labels may be lineage or group labels; unknown labels raise an
+  error.
+- `library_key` identifies the sequencing library (e.g. 10x channel) of each
+  cell. It is optional and does not change the score or the flag. It enables
+  `mixing_source`: each flagged cell is refitted as "own lineage + the single
+  best foreign profile" and as "own lineage + the library's pooled profile" (a
+  proxy for ambient RNA). `"doublet"` means one specific foreign cell type
+  explains the signal better, as for a heterotypic doublet or attached material
+  from one cell. `"ambient"` means a pooled, soup-like profile explains it
+  better. Pass the library, not a coarser processing batch, because ambient RNA
+  is shared within a library.
+
+Notes:
+
+- Requires raw counts (`adata.raw.X` by default, or `layer=`); it raises on
+  log-normalized input.
+- Use a coarse `groupby` such as subclass. If a contaminated population is its
+  own group, its profile absorbs the contamination and it cannot be detected.
+- The score distribution is usually bimodal, with clean cells near 0 and
+  mixtures well above. Check a histogram of `mixing_foreign_umi` per group
+  before relying on the default `threshold=0.3`.
+- Review `summary` at a finer level such as subtype. A subcluster with a
+  consistent foreign type and a high flagged fraction is often better removed
+  as a whole than cell by cell.
 
 ## Notes
 
