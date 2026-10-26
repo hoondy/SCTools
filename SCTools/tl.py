@@ -11,6 +11,7 @@ from ._shared import (
     _require_raw,
     _require_scanpy,
     ad,
+    h5py,
     importlib,
     logger,
     np,
@@ -948,23 +949,52 @@ def _mixing_counts_matrix(adata, layer, use_raw):
     if layer is not None:
         if layer not in adata.layers:
             raise KeyError(f"`{layer}` not found in `adata.layers`.")
-        return adata.layers[layer], adata.var_names
-    if use_raw is None:
-        use_raw = adata.raw is not None
-    if use_raw:
-        _require_raw(adata, context="`detect_lineage_mixing` with `use_raw=True`")
-        return adata.raw.X, adata.raw.var_names
-    return adata.X, adata.var_names
+        M, gene_names = adata.layers[layer], adata.var_names
+    else:
+        if use_raw is None:
+            use_raw = adata.raw is not None
+        if use_raw:
+            _require_raw(adata, context="`detect_lineage_mixing` with `use_raw=True`")
+            M, gene_names = adata.raw.X, adata.raw.var_names
+        else:
+            M, gene_names = adata.X, adata.var_names
+    group, encoding = _backed_sparse_group(M)
+    if encoding == "csc_matrix":
+        # rows of a CSC matrix span every column, so read it into memory once
+        M = sparse.csc_matrix((group["data"][:], group["indices"][:], group["indptr"][:]), shape=M.shape).tocsr()
+    return M, gene_names
+
+
+def _backed_sparse_group(M):
+    """Return (HDF5 group, encoding) behind a backed AnnData sparse matrix, else (None, None)."""
+    group = getattr(M, "group", None)
+    if not isinstance(group, h5py.Group):
+        return None, None
+    encoding = group.attrs.get("encoding-type")
+    if isinstance(encoding, bytes):
+        encoding = encoding.decode()
+    return (group, encoding) if encoding in ("csr_matrix", "csc_matrix") else (None, None)
 
 
 def _iter_row_chunks(M, chunk_size):
     """Yield (start, end, csr block) over contiguous row chunks of an in-memory or backed matrix."""
-    n_obs = M.shape[0]
+    n_obs, n_vars = M.shape
+    # Backed CSR rows are read straight from HDF5: anndata's backed indexing fails with some
+    # anndata/scipy combinations (e.g. anndata 0.10 with scipy >= 1.15).
+    group, encoding = _backed_sparse_group(M)
+    indptr = group["indptr"][:] if encoding == "csr_matrix" else None
     for start in range(0, n_obs, chunk_size):
         end = min(n_obs, start + chunk_size)
-        block = M[start:end]
-        if not sparse.issparse(block):
-            block = np.asarray(block)
+        if indptr is not None:
+            lo, hi = indptr[start], indptr[end]
+            block = sparse.csr_matrix(
+                (group["data"][lo:hi], group["indices"][lo:hi], indptr[start : end + 1] - lo),
+                shape=(end - start, n_vars),
+            )
+        else:
+            block = M[start:end]
+            if not sparse.issparse(block):
+                block = np.asarray(block)
         yield start, end, sparse.csr_matrix(block)
 
 

@@ -171,5 +171,22 @@ class DetectLineageMixingTests(unittest.TestCase):
         self.assertIn("mixing_source", back.obs)
         self.assertIn("library_summary", back.uns["mixing"])
 
+    def test_backed_h5ad_matches_in_memory(self):
+        for raw_format in ("csr", "csc"):
+            with self.subTest(raw_format=raw_format), tempfile.TemporaryDirectory() as tmp:
+                adata = _make_adata(n_pure=60, n_doublet=10, n_ambient=0, n_opc_oligo=0)
+                adata.raw = ad.AnnData(adata.X.asformat(raw_format), var=adata.var)
+                adata.X = adata.X.log1p()
+                path = os.path.join(tmp, "counts_in_raw.h5ad")
+                adata.write_h5ad(path)
+
+                sct.tl.detect_lineage_mixing(adata, lineage_key="class", n_markers=20, chunk_size=37)
+                backed = ad.read_h5ad(path, backed="r")
+                sct.tl.detect_lineage_mixing(backed, lineage_key="class", n_markers=20, chunk_size=37)
+                backed.file.close()
+
+                np.testing.assert_allclose(backed.obs["mixing_UMI_frac"], adata.obs["mixing_UMI_frac"], atol=1e-6)
+                self.assertGreater(int(backed.obs["mixing_flag"].sum()), 0)
+
 if __name__ == "__main__":
     unittest.main()
