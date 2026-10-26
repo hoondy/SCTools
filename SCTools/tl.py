@@ -941,11 +941,490 @@ def pls_score(
     return diagnostics
 
 
+def _mixing_counts_matrix(adata, layer, use_raw):
+    """Return a row-sliceable count matrix and its gene names."""
+    if layer is not None and use_raw:
+        raise ValueError("Pass either `layer` or `use_raw=True`, not both.")
+    if layer is not None:
+        if layer not in adata.layers:
+            raise KeyError(f"`{layer}` not found in `adata.layers`.")
+        return adata.layers[layer], adata.var_names
+    if use_raw is None:
+        use_raw = adata.raw is not None
+    if use_raw:
+        _require_raw(adata, context="`detect_lineage_mixing` with `use_raw=True`")
+        return adata.raw.X, adata.raw.var_names
+    return adata.X, adata.var_names
+
+
+def _iter_row_chunks(M, chunk_size):
+    """Yield (start, end, csr block) over contiguous row chunks of an in-memory or backed matrix."""
+    n_obs = M.shape[0]
+    for start in range(0, n_obs, chunk_size):
+        end = min(n_obs, start + chunk_size)
+        block = M[start:end]
+        if not sparse.issparse(block):
+            block = np.asarray(block)
+        yield start, end, sparse.csr_matrix(block)
+
+
+def _top_two(M):
+    """Per-column largest and second-largest values of a 2D array (rows >= 2)."""
+    part = np.partition(M, M.shape[0] - 2, axis=0)
+    return part[-1], part[-2]
+
+
+def _specific_genes(means, allowed, n_markers, min_lfc, min_expr):
+    """Indices of the top group-specific genes: log2(mean_k / max other mean) >= min_lfc."""
+    eps = 1e-7
+    if means.shape[0] < 2:
+        return set()
+    first, second = _top_two(means)
+    selected = set()
+    for k in range(means.shape[0]):
+        other = np.where(means[k] >= first, second, first)
+        lfc = np.log2((means[k] + eps) / (other + eps))
+        idx = np.where(allowed & (lfc >= min_lfc) & (means[k] >= min_expr))[0]
+        selected.update(idx[np.argsort(-lfc[idx])][:n_markers].tolist())
+    return selected
+
+
+def _mixing_profiles(X, codes, n_groups, pseudocount=1e-6):
+    """Row-normalized mean per-cell proportion profiles for each group code."""
+    totals = np.asarray(X.sum(1)).ravel()
+    valid = codes >= 0
+    rows = np.where(valid)[0]
+    norm = sparse.diags(1.0 / np.maximum(totals[rows], 1.0)) @ X[rows]
+    S = sparse.csr_matrix((np.ones(rows.size), (codes[rows], np.arange(rows.size))), shape=(n_groups, rows.size))
+    n_per = np.asarray(S.sum(1)).ravel()
+    P = np.asarray((S @ norm).todense()) / np.maximum(n_per, 1)[:, None] + pseudocount
+    return P / P.sum(1, keepdims=True)
+
+
+def _fit_mixture_weights(X, P, max_iter=300, tol=1e-4, chunk_size=20000, extra=None, extra_index=None):
+    """EM estimate of per-cell mixing weights over fixed expression profiles.
+
+    Each row of ``X`` (counts) is modelled as multinomial with probabilities
+    ``sum_k W[i, k] * P[k]``. If ``extra`` is given, each cell gets one more
+    component, ``extra[extra_index[i]]``, whose weight is the last column of ``W``.
+    Returns ``W`` (rows sum to 1) and the per-cell multinomial log-likelihood
+    (without the constant term).
+    """
+    X = sparse.csr_matrix(X)
+    n_obs = X.shape[0]
+    P = np.asarray(P, dtype=np.float64)
+    n_comp = P.shape[0] + (extra is not None)
+    W = np.full((n_obs, n_comp), 1.0 / n_comp)
+    loglik = np.zeros(n_obs)
+    for start in range(0, n_obs, chunk_size):
+        end = min(n_obs, start + chunk_size)
+        Xc = X[start:end].astype(np.float64)
+        Xc.sort_indices()
+        rows = np.repeat(np.arange(end - start), np.diff(Xc.indptr))
+        cols = Xc.indices
+        totals = np.maximum(np.asarray(Xc.sum(1)).ravel(), 1.0)
+        E = None if extra is None else np.asarray(extra, dtype=np.float64)[extra_index[start:end]]
+        Wc = W[start:end]
+
+        def mixture_at_nonzeros(Wc):
+            dense = Wc[:, : P.shape[0]] @ P
+            if E is not None:
+                dense = dense + Wc[:, -1:] * E
+            return dense[rows, cols]
+
+        for _ in range(max_iter):
+            ratio = Xc.data / mixture_at_nonzeros(Wc)
+            R = sparse.csr_matrix((ratio, cols, Xc.indptr), shape=Xc.shape)
+            grad = R @ P.T
+            if E is not None:
+                grad = np.column_stack([grad, np.bincount(rows, weights=ratio * E[rows, cols], minlength=end - start)])
+            W_new = Wc * grad / totals[:, None]
+            converged = np.abs(W_new - Wc).max() < tol
+            Wc = W_new
+            if converged:
+                break
+        W[start:end] = Wc
+        loglik[start:end] = np.bincount(rows, weights=Xc.data * np.log(mixture_at_nonzeros(Wc)), minlength=end - start)
+    return W, loglik
+
+
+def detect_lineage_mixing(
+    adata: ad.AnnData,
+    groupby: str = "subclass",
+    lineage_key: str = None,
+    known_lineage_sets=None,
+    layer: str = None,
+    use_raw: bool = None,
+    library_key: str = None,
+    threshold: float = 0.3,
+    summary_by=None,
+    n_markers: int = 150,
+    min_lfc: float = 1.0,
+    min_expr_quantile: float = 0.5,
+    exclude_genes=None,
+    max_ref_cells: int = 5000,
+    min_group_size: int = 20,
+    core_quantile: float = 0.5,
+    n_refine: int = 2,
+    max_iter: int = 300,
+    tol: float = 1e-4,
+    chunk_size: int = 20000,
+    key_added: str = "mixing",
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """Flag cells whose transcriptome is a mixture of cell types from different lineages.
+
+    Heterotypic doublets, nuclei carrying attached material from another cell, and
+    heavily ambient-contaminated nuclei all look like a mixture of two or more cell
+    type profiles. Each cell's counts over an informative marker panel are modelled
+    as ``x_i ~ Multinomial(n_i, sum_k w_ik * p_k)``, where ``p_k`` are fixed
+    reference profiles for the ``groupby`` labels and ``w_i`` are per-cell mixing
+    weights fitted by EM. The foreign score is the total weight on profiles outside
+    the cell's own lineage, i.e. the fraction of the cell's marker-panel UMIs
+    attributed to other lineages. Clean cells score close to 0; a doublet of two
+    cells with similar panel depth scores around 0.5.
+
+    Reference profiles are built from up to ``max_ref_cells`` cells per group and
+    refined ``n_refine`` times on the purest ``1 - core_quantile`` of each group,
+    so contaminated cells (a minority of their group) do not leak into the
+    references. Use a coarse ``groupby`` (e.g. subclass): if a contaminated
+    population is its own group, its profile absorbs the contamination.
+
+    With ``library_key``, each flagged cell is also classified by where its
+    foreign signal comes from, comparing the log-likelihood of "own lineage + the
+    single best foreign profile" with that of "own lineage + the library's pooled
+    profile" (a proxy for ambient RNA). ``"doublet"`` means one specific foreign
+    cell type explains the signal better, as for a heterotypic doublet or
+    attached material from one cell; ``"ambient"`` means a pooled, soup-like
+    profile explains it better.
+
+    Parameters
+    ----------
+    adata
+        AnnData with raw counts in ``adata.raw.X`` (default when present),
+        ``adata.layers[layer]``, or ``adata.X``. Backed AnnData is supported; the
+        matrix is streamed in ``chunk_size`` row blocks.
+    groupby
+        ``.obs`` column with the cell type labels used as mixture components.
+    lineage_key
+        ``.obs`` column assigning each ``groupby`` label to a broader lineage
+        (e.g. ``"class"``). Mixing between groups of the same lineage is not
+        counted as foreign. Defaults to ``groupby``, so every group is its own
+        lineage.
+    known_lineage_sets
+        Sets of lineages known to be connected, each treated as one lineage,
+        given as a list of label collections, e.g. ``[("OPC", "Oligo")]``. Use
+        this when cells transitioning between lineages are expected (such as
+        differentiating OPCs) so they are not flagged; mixtures within a set are
+        then no longer detected. Labels may be ``lineage_key`` values or
+        ``groupby`` labels.
+    library_key
+        ``.obs`` column identifying each cell's sequencing library (e.g. 10x
+        channel). Cells of one library share one ambient RNA pool, so pass the
+        library rather than a coarser processing batch. Optional: it does not
+        change the foreign score or the flag, but enables the doublet/ambient
+        classification and a per-library summary.
+    threshold
+        Cells with ``{key_added}_UMI_frac >= threshold`` are flagged.
+    summary_by
+        ``.obs`` column(s) for the returned summary; defaults to ``groupby``. Use a
+        finer label such as ``"subtype"`` to find whole clusters to drop.
+    n_markers, min_lfc, min_expr_quantile
+        Marker panel: up to ``n_markers`` genes per group and per lineage with
+        log2 specificity ``>= min_lfc`` and mean expression above the
+        ``min_expr_quantile`` quantile of per-gene maxima.
+    exclude_genes
+        Genes never used in the panel (list of names or boolean mask). Defaults to
+        mitochondrial (``MT-``) and ribosomal protein (``RPL``/``RPS``) genes.
+    min_group_size
+        Groups with fewer cells get no profile; their cells are left unscored.
+
+    Writes
+    ------
+    ``adata.obs``:
+
+    - ``{key_added}_UMI_frac``: fraction of the cell's marker-panel UMIs
+      attributed to other lineages; the score used for flagging.
+    - ``{key_added}_RNA_frac``: the same converted to an estimated fraction of
+      the cell's total RNA, using each profile's typical panel share.
+    - ``{key_added}_top`` and ``{key_added}_top_weight``: the
+      foreign group with the largest weight, and that weight.
+    - ``{key_added}_flag``: 1 if flagged, else 0.
+    - With ``library_key``, for flagged cells: ``{key_added}_source``
+      (``"doublet"`` or ``"ambient"``) and ``{key_added}_doublet_logLR``, the
+      log-likelihood ratio behind it (positive favours ``"doublet"``).
+
+    ``adata.obsm[f"{key_added}_weights"]``: per-cell weights over groups.
+    ``adata.uns[key_added]``: parameters, groups, lineages, panel genes,
+    profiles, and summaries.
+
+    Returns
+    -------
+    Per-``summary_by`` DataFrame with cell counts, median foreign score, flagged
+    fraction, most frequent foreign type among flagged cells, and (with
+    ``library_key``) the fraction of flagged cells classified as ``"doublet"``.
+    """
+    if groupby not in adata.obs.columns:
+        raise KeyError(f"`groupby`={groupby!r} not in adata.obs.")
+    if lineage_key is not None and lineage_key not in adata.obs.columns:
+        raise KeyError(f"`lineage_key`={lineage_key!r} not in adata.obs.")
+    if library_key is not None and library_key not in adata.obs.columns:
+        raise KeyError(f"`library_key`={library_key!r} not in adata.obs.")
+    if not 0 < threshold < 1:
+        raise ValueError("`threshold` must be between 0 and 1.")
+    if not 0 <= core_quantile < 1:
+        raise ValueError("`core_quantile` must be in [0, 1).")
+
+    start_time = time.perf_counter()
+    rng = np.random.default_rng(random_state)
+    M, gene_names = _mixing_counts_matrix(adata, layer, use_raw)
+    if M.shape[0] != adata.n_obs:
+        raise ValueError("Count matrix rows do not match `adata.n_obs`.")
+    n_obs, n_genes = M.shape
+
+    # ---- labels and lineages ----
+    labels = adata.obs[groupby].astype("category")
+    lineage_values = adata.obs[lineage_key].astype(str) if lineage_key is not None else labels.astype(str)
+    lineage_of_group = {}
+    for group, lineage in pd.DataFrame({"g": labels, "l": lineage_values}).dropna().drop_duplicates().itertuples(index=False):
+        if group in lineage_of_group and lineage_of_group[group] != lineage:
+            raise ValueError(f"Group {group!r} maps to more than one `{lineage_key}` value.")
+        lineage_of_group[group] = lineage
+    for merged in known_lineage_sets or []:
+        merged = [str(label) for label in merged]
+        known = {str(g) for g in lineage_of_group} | set(lineage_of_group.values())
+        unknown = sorted(set(merged) - known)
+        if unknown:
+            raise KeyError(f"`known_lineage_sets` labels not found as groups or lineages: {unknown}.")
+        merged_name = "+".join(merged)
+        lineage_of_group = {
+            g: merged_name if (str(g) in merged or lin in merged) else lin for g, lin in lineage_of_group.items()
+        }
+
+    sizes = labels.value_counts()
+    groups = np.array(sorted(g for g in sizes.index if sizes[g] >= min_group_size), dtype=object)
+    if len(groups) < 2:
+        raise ValueError("Need at least two groups with `min_group_size` cells.")
+    skipped = sorted(set(sizes.index[sizes > 0]) - set(groups))
+    if skipped:
+        logger.warning("detect_lineage_mixing: groups below min_group_size are left unscored: %s", skipped)
+    n_groups = len(groups)
+    group_lineage = np.array([lineage_of_group[g] for g in groups], dtype=object)
+    codes = pd.Categorical(labels, categories=groups).codes.astype(np.int64)
+    cell_lineage = labels.astype(object).map(lineage_of_group).to_numpy(dtype=object)
+
+    ref_codes = np.full(n_obs, -1, dtype=np.int64)
+    for k in range(n_groups):
+        members = np.where(codes == k)[0]
+        if members.size > max_ref_cells:
+            members = rng.choice(members, size=max_ref_cells, replace=False)
+        ref_codes[members] = k
+
+    # ---- gene exclusion ----
+    gene_names = pd.Index(gene_names).astype(str)
+    if exclude_genes is None:
+        excluded = np.asarray(gene_names.str.match(r"^(MT-|mt-|RP[LS]\d|Rp[ls]\d)"), dtype=bool)
+    else:
+        excluded = np.asarray(exclude_genes)
+        if excluded.dtype != bool:
+            excluded = np.asarray(gene_names.isin(list(exclude_genes)), dtype=bool)
+    allowed = ~excluded
+
+    # ---- pass 1: per-group mean proportions over all genes (reference cells) ----
+    sums = np.zeros((n_groups, n_genes))
+    totals = np.zeros(n_obs)
+    checked_counts = False
+    for start, end, block in _iter_row_chunks(M, chunk_size):
+        if not checked_counts and block.nnz:
+            sample = block.data[: min(block.nnz, 100_000)]
+            if not np.allclose(sample, np.round(sample)):
+                raise ValueError(
+                    "detect_lineage_mixing expects raw counts; the selected matrix has non-integer values. "
+                    "Use `use_raw=True` or `layer=` to point at counts."
+                )
+            checked_counts = True
+        row_totals = np.asarray(block.sum(1)).ravel()
+        totals[start:end] = row_totals
+        chunk_codes = ref_codes[start:end]
+        keep = np.where(chunk_codes >= 0)[0]
+        if keep.size:
+            norm = sparse.diags(1.0 / np.maximum(row_totals[keep], 1.0)) @ block[keep]
+            S = sparse.csr_matrix((np.ones(keep.size), (chunk_codes[keep], np.arange(keep.size))), shape=(n_groups, keep.size))
+            sums += np.asarray((S @ norm).todense())
+    n_ref = np.bincount(ref_codes[ref_codes >= 0], minlength=n_groups)
+    group_means = sums / np.maximum(n_ref, 1)[:, None]
+
+    lineages = np.array(sorted(set(group_lineage)), dtype=object)
+    lineage_means = np.vstack(
+        [np.average(group_means[group_lineage == lin], axis=0, weights=n_ref[group_lineage == lin]) for lin in lineages]
+    )
+    min_expr = np.quantile(group_means[:, allowed].max(0), min_expr_quantile)
+    panel = sorted(
+        _specific_genes(group_means, allowed, n_markers, min_lfc, min_expr)
+        | _specific_genes(lineage_means, allowed, n_markers, min_lfc, min_expr)
+    )
+    panel = np.asarray(panel, dtype=np.int64)
+    if panel.size == 0:
+        raise ValueError("No marker genes passed the panel filters; relax `min_lfc` or `min_expr_quantile`.")
+    logger.info("detect_lineage_mixing: %d groups, %d lineages, %d panel genes.", n_groups, len(lineages), panel.size)
+
+    # ---- pass 2: panel counts for every cell ----
+    if sparse.issparse(M) and isinstance(M, (sparse.csr_matrix, sparse.csr_array)):
+        Xp = sparse.csr_matrix(M[:, panel], dtype=np.float64)
+    else:
+        Xp = sparse.vstack([block[:, panel] for _, _, block in _iter_row_chunks(M, chunk_size)], format="csr").astype(np.float64)
+    panel_fraction = np.asarray(Xp.sum(1)).ravel() / np.maximum(totals, 1.0)
+
+    # ---- reference refinement on the purest cells of each group ----
+    same_lineage = group_lineage[:, None] == group_lineage[None, :]
+    ref_idx = np.where(ref_codes >= 0)[0]
+    ref_group = ref_codes[ref_idx]
+    core = ref_group.copy()
+    for round_ in range(n_refine + 1):
+        P = _mixing_profiles(Xp[ref_idx], core, n_groups)
+        if round_ == n_refine:
+            break
+        W_ref, _ = _fit_mixture_weights(Xp[ref_idx], P, max_iter, tol, chunk_size)
+        own_ref = (W_ref * same_lineage[ref_group]).sum(1)
+        core = np.full(ref_idx.size, -1, dtype=np.int64)
+        for k in range(n_groups):
+            members = ref_group == k
+            core[members & (own_ref >= np.quantile(own_ref[members], core_quantile))] = k
+        logger.info(
+            "detect_lineage_mixing: refinement %d, median reference foreign weight %.3f.",
+            round_ + 1,
+            float(np.median(1 - own_ref)),
+        )
+
+    # ---- score every cell ----
+    W, _ = _fit_mixture_weights(Xp, P, max_iter, tol, chunk_size)
+    scored = codes >= 0
+    own_mask = np.zeros((n_obs, n_groups), dtype=bool)
+    own_mask[scored] = group_lineage[None, :] == cell_lineage[scored, None]
+    umi_frac = np.where(scored, 1 - (W * own_mask).sum(1), np.nan)
+    foreign_weights = np.where(own_mask, -1.0, W)
+    top_idx = foreign_weights.argmax(1)
+    top_weight = np.where(scored, foreign_weights.max(1), np.nan)
+    top = pd.Categorical(np.where(scored, groups[top_idx], None), categories=groups)
+
+    # convert panel-UMI weights to total-RNA fractions with each profile's panel share
+    core_cells = ref_idx[core >= 0]
+    profile_panel_fraction = np.array(
+        [np.median(panel_fraction[core_cells[core[core >= 0] == k]]) for k in range(n_groups)]
+    )
+    rna = W / np.maximum(profile_panel_fraction, 1e-9)
+    rna /= rna.sum(1, keepdims=True)
+    rna_frac = np.where(scored, 1 - (rna * own_mask).sum(1), np.nan)
+
+    flag = scored & (umi_frac >= threshold)
+
+    # ---- doublet-like (one foreign type) vs ambient-like (library pool) foreign signal ----
+    log_lr = np.full(n_obs, np.nan)
+    source = np.full(n_obs, None, dtype=object)
+    if library_key is not None and flag.any():
+        libraries = adata.obs[library_key].astype("category")
+        library_codes = libraries.cat.codes.to_numpy()
+        in_library = np.where(library_codes >= 0)[0]
+        pool = sparse.csr_matrix(
+            (np.ones(in_library.size), (library_codes[in_library], in_library)),
+            shape=(len(libraries.cat.categories), n_obs),
+        )
+        ambient = np.asarray((pool @ Xp).todense()) + 1e-3
+        ambient /= ambient.sum(1, keepdims=True)
+        testable = flag & (library_codes >= 0)
+        for lin in np.unique(cell_lineage[testable].astype(str)):
+            idx = np.where(testable & (cell_lineage == lin))[0]
+            own_profiles = P[group_lineage == lin]
+            _, ll_doublet = _fit_mixture_weights(
+                Xp[idx], own_profiles, max_iter, tol, chunk_size, extra=P, extra_index=top_idx[idx]
+            )
+            _, ll_ambient = _fit_mixture_weights(
+                Xp[idx], own_profiles, max_iter, tol, chunk_size, extra=ambient, extra_index=library_codes[idx]
+            )
+            log_lr[idx] = ll_doublet - ll_ambient
+        has_log_lr = ~np.isnan(log_lr)
+        source[has_log_lr] = np.where(log_lr[has_log_lr] > 0, "doublet", "ambient")
+
+    # ---- write outputs ----
+    adata.obs[f"{key_added}_UMI_frac"] = umi_frac.astype(np.float32)
+    adata.obs[f"{key_added}_RNA_frac"] = rna_frac.astype(np.float32)
+    adata.obs[f"{key_added}_top"] = top
+    adata.obs[f"{key_added}_top_weight"] = top_weight.astype(np.float32)
+    adata.obs[f"{key_added}_flag"] = flag.astype(int)
+    if library_key is not None:
+        adata.obs[f"{key_added}_source"] = pd.Categorical(source, categories=["doublet", "ambient"])
+        adata.obs[f"{key_added}_doublet_logLR"] = log_lr.astype(np.float32)
+    adata.obsm[f"{key_added}_weights"] = W.astype(np.float32)
+
+    summary_by = groupby if summary_by is None else summary_by
+    frame = pd.DataFrame(
+        {"umi_frac": umi_frac, "flag": flag, "top": top.astype(object), "source": source},
+        index=adata.obs.index,
+    )
+    rows = []
+    for group_name, positions in _iter_obs_groups(adata.obs, summary_by):
+        sub = frame.iloc[positions]
+        flagged = sub[sub["flag"]]
+        row = {
+            "group": group_name,
+            "n_cells": int(len(sub)),
+            "median_UMI_frac": float(sub["umi_frac"].median()),
+            "n_flagged": int(len(flagged)),
+            "flag_fraction": float(sub["flag"].mean()) if len(sub) else np.nan,
+            "top": flagged["top"].mode().iloc[0] if len(flagged) else None,
+        }
+        if library_key is not None:
+            row["doublet_fraction"] = float((flagged["source"] == "doublet").mean()) if len(flagged) else np.nan
+        rows.append(row)
+    summary = pd.DataFrame(rows)
+    summary["top"] = summary["top"].astype("category")
+
+    library_summary = None
+    if library_key is not None:
+        library_frame = frame.assign(library=adata.obs[library_key].astype(str).to_numpy())
+        library_summary = library_frame.groupby("library").agg(
+            n_cells=("flag", "size"),
+            flag_fraction=("flag", "mean"),
+            median_UMI_frac=("umi_frac", "median"),
+        )
+        library_summary["median_UMI_frac_unflagged"] = (
+            library_frame[~library_frame["flag"]].groupby("library")["umi_frac"].median()
+        )
+        library_summary = library_summary.reset_index()
+
+    adata.uns[key_added] = {
+        "groupby": groupby,
+        "threshold": float(threshold),
+        "groups": groups.astype(str),
+        "group_lineage": group_lineage.astype(str),
+        "panel_genes": gene_names[panel].to_numpy().astype(str),
+        "profiles": P.astype(np.float32),
+        "profile_panel_fraction": profile_panel_fraction,
+        "n_flagged": int(flag.sum()),
+        "group_summary": summary,
+    }
+    if lineage_key is not None:
+        adata.uns[key_added]["lineage_key"] = lineage_key
+    if library_summary is not None:
+        adata.uns[key_added]["library_key"] = library_key
+        adata.uns[key_added]["library_summary"] = library_summary
+
+    logger.info(
+        "detect_lineage_mixing: flagged %d of %d scored cells (%.2f%%) in %.1fs.",
+        int(flag.sum()),
+        int(scored.sum()),
+        100.0 * flag.sum() / max(int(scored.sum()), 1),
+        time.perf_counter() - start_time,
+    )
+    return summary
+
+
 __all__ = [
     "agg_by_cluster",
     "corrMat",
     "cos_similarity",
     "diff_markers",
+    "detect_lineage_mixing",
     "detect_outliers",
     "info",
     "l2_distance",
