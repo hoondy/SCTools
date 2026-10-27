@@ -366,6 +366,33 @@ def _as_obs_mask(adata, selector, *, name):
     return arr.astype(bool)
 
 
+def _result_target(adata):
+    """Return the AnnData that receives per-cell results, and a function placing values at ``adata``'s rows.
+
+    Writing into a view makes anndata copy it, which fails for backed AnnData and otherwise
+    leaves the caller's object untouched. Results for a view therefore go into its parent:
+    ``expand(values, fill)`` returns parent-length values with ``fill`` outside the view.
+    """
+    if not adata.is_view:
+        return adata, lambda values, fill: values
+    parent = adata._adata_ref
+    positions = np.arange(parent.n_obs)[adata._oidx]
+
+    def expand(values, fill):
+        values = np.asarray(values)
+        out = np.full((parent.n_obs,) + values.shape[1:], fill, dtype=values.dtype)
+        out[positions] = values
+        return out
+
+    return parent, expand
+
+
+def _refresh_view(adata):
+    """Re-slice a view from its parent so it shows results just written to the parent."""
+    if adata.is_view:
+        adata._init_as_view(adata._adata_ref, adata._oidx, adata._vidx)
+
+
 def detect_outliers(
     adata: ad.AnnData,
     groupby: str = "subclass",
@@ -408,6 +435,10 @@ def detect_outliers(
     ----------
     adata
         AnnData object containing the embedding in ``adata.obsm[use_rep]``.
+        Backed AnnData is supported. A view such as ``adata[mask]`` scores only
+        its cells but writes the results into its parent ``adata`` (and the
+        view); cells outside the view are left unscored (outlier 0, method
+        ``"unassigned"``).
     groupby
         Observation column used to fit separate outlier models. Set to ``None``
         to fit one model across all cells.
@@ -569,7 +600,8 @@ def detect_outliers(
         outlier[force_outlier_mask] = True
         method_used[force_outlier_mask] = "forced_outlier"
 
-    adata.obs[outlier_key] = outlier.astype(int)
+    target, expand = _result_target(adata)
+    target.obs[outlier_key] = expand(outlier.astype(int), 0)
 
     summary = pd.DataFrame(rows)
     if not summary.empty:
@@ -583,12 +615,12 @@ def detect_outliers(
         summary["outlier_fraction"] = summary["n_outliers"] / summary["n_cells"]
 
     if store_details:
-        adata.obs[f"{outlier_key}_method"] = pd.Categorical(method_used)
-        adata.obs[f"{outlier_key}_score"] = score
+        target.obs[f"{outlier_key}_method"] = pd.Categorical(expand(method_used, "unassigned"))
+        target.obs[f"{outlier_key}_score"] = expand(score, np.nan)
         if np.any(pd.notna(dbscan_label)):
-            adata.obs[f"{outlier_key}_dbscan_label"] = pd.array(dbscan_label, dtype="Int64")
+            target.obs[f"{outlier_key}_dbscan_label"] = pd.array(expand(dbscan_label, pd.NA), dtype="Int64")
 
-        adata.uns[diagnostics_key] = {
+        target.uns[diagnostics_key] = {
             "use_rep": use_rep,
             "groupby": groupby,
             "method": method,
@@ -612,6 +644,7 @@ def detect_outliers(
             "group_summary": summary,
         }
 
+    _refresh_view(adata)
     return summary
 
 
@@ -943,26 +976,40 @@ def pls_score(
 
 
 def _mixing_counts_matrix(adata, layer, use_raw):
-    """Return a row-sliceable count matrix and its gene names."""
+    """Return a row-sliceable count matrix, its gene names, and the rows of it holding ``adata``'s cells.
+
+    For a view of a backed AnnData this is the parent's matrix with the view's rows, so counts
+    stream from the file rather than through anndata's backed view indexing, which loads them
+    all and fails with some anndata/scipy combinations. Otherwise rows is None (all rows).
+    """
     if layer is not None and use_raw:
         raise ValueError("Pass either `layer` or `use_raw=True`, not both.")
     if layer is not None:
         if layer not in adata.layers:
             raise KeyError(f"`{layer}` not found in `adata.layers`.")
-        M, gene_names = adata.layers[layer], adata.var_names
-    else:
-        if use_raw is None:
-            use_raw = adata.raw is not None
-        if use_raw:
-            _require_raw(adata, context="`detect_lineage_mixing` with `use_raw=True`")
-            M, gene_names = adata.raw.X, adata.raw.var_names
-        else:
-            M, gene_names = adata.X, adata.var_names
+        return adata.layers[layer], adata.var_names, None
+
+    if use_raw is None:
+        use_raw = adata.raw is not None
+    if use_raw:
+        _require_raw(adata, context="`detect_lineage_mixing` with `use_raw=True`")
+    source, rows = adata, None
+    if adata.is_view and adata.isbacked:
+        parent = adata._adata_ref
+        positions = np.arange(parent.n_obs)[adata._oidx]
+        # raw ignores the view's gene subset; X only matches the parent if the view keeps every gene
+        same_genes = use_raw or adata.var_names.equals(parent.var_names)
+        if same_genes and np.all(np.diff(positions) > 0):
+            source, rows = parent, positions
+    M, gene_names = (source.raw.X, source.raw.var_names) if use_raw else (source.X, source.var_names)
+
     group, encoding = _backed_sparse_group(M)
     if encoding == "csc_matrix":
         # rows of a CSC matrix span every column, so read it into memory once
         M = sparse.csc_matrix((group["data"][:], group["indices"][:], group["indptr"][:]), shape=M.shape).tocsr()
-    return M, gene_names
+        if rows is not None:
+            M, rows = M[rows], None
+    return M, gene_names, rows
 
 
 def _backed_sparse_group(M):
@@ -976,26 +1023,38 @@ def _backed_sparse_group(M):
     return (group, encoding) if encoding in ("csr_matrix", "csc_matrix") else (None, None)
 
 
-def _iter_row_chunks(M, chunk_size):
-    """Yield (start, end, csr block) over contiguous row chunks of an in-memory or backed matrix."""
+def _iter_row_chunks(M, chunk_size, rows=None):
+    """Yield (start, end, csr block) over contiguous row chunks of an in-memory or backed matrix.
+
+    With ``rows`` (increasing row positions), blocks hold ``M[rows[start:end]]`` and at most
+    ``chunk_size`` consecutive rows of ``M`` are read at a time.
+    """
     n_obs, n_vars = M.shape
     # Backed CSR rows are read straight from HDF5: anndata's backed indexing fails with some
     # anndata/scipy combinations (e.g. anndata 0.10 with scipy >= 1.15).
     group, encoding = _backed_sparse_group(M)
     indptr = group["indptr"][:] if encoding == "csr_matrix" else None
-    for start in range(0, n_obs, chunk_size):
-        end = min(n_obs, start + chunk_size)
+    for first in range(0, n_obs, chunk_size):
+        last = min(n_obs, first + chunk_size)
+        start, end = (first, last) if rows is None else np.searchsorted(rows, [first, last])
+        if start == end:
+            continue
+        if rows is not None:
+            first, last = rows[start], rows[end - 1] + 1
         if indptr is not None:
-            lo, hi = indptr[start], indptr[end]
+            lo, hi = indptr[first], indptr[last]
             block = sparse.csr_matrix(
-                (group["data"][lo:hi], group["indices"][lo:hi], indptr[start : end + 1] - lo),
-                shape=(end - start, n_vars),
+                (group["data"][lo:hi], group["indices"][lo:hi], indptr[first : last + 1] - lo),
+                shape=(last - first, n_vars),
             )
         else:
-            block = M[start:end]
+            block = M[first:last]
             if not sparse.issparse(block):
                 block = np.asarray(block)
-        yield start, end, sparse.csr_matrix(block)
+        block = sparse.csr_matrix(block)
+        if rows is not None:
+            block = block[rows[start:end] - first]
+        yield start, end, block
 
 
 def _top_two(M):
@@ -1133,7 +1192,10 @@ def detect_lineage_mixing(
     adata
         AnnData with raw counts in ``adata.raw.X`` (default when present),
         ``adata.layers[layer]``, or ``adata.X``. Backed AnnData is supported; the
-        matrix is streamed in ``chunk_size`` row blocks.
+        matrix is streamed in ``chunk_size`` row blocks. A view such as
+        ``adata[mask]`` scores only its cells but writes the results into its
+        parent ``adata`` (and the view); cells outside the view are left
+        unscored.
     groupby
         ``.obs`` column with the cell type labels used as mixture components.
     lineage_key
@@ -1207,10 +1269,10 @@ def detect_lineage_mixing(
 
     start_time = time.perf_counter()
     rng = np.random.default_rng(random_state)
-    M, gene_names = _mixing_counts_matrix(adata, layer, use_raw)
-    if M.shape[0] != adata.n_obs:
+    M, gene_names, rows = _mixing_counts_matrix(adata, layer, use_raw)
+    if (M.shape[0] if rows is None else rows.size) != adata.n_obs:
         raise ValueError("Count matrix rows do not match `adata.n_obs`.")
-    n_obs, n_genes = M.shape
+    n_obs, n_genes = adata.n_obs, M.shape[1]
 
     # ---- labels and lineages ----
     labels = adata.obs[groupby].astype("category")
@@ -1264,7 +1326,7 @@ def detect_lineage_mixing(
     sums = np.zeros((n_groups, n_genes))
     totals = np.zeros(n_obs)
     checked_counts = False
-    for start, end, block in _iter_row_chunks(M, chunk_size):
+    for start, end, block in _iter_row_chunks(M, chunk_size, rows):
         if not checked_counts and block.nnz:
             sample = block.data[: min(block.nnz, 100_000)]
             if not np.allclose(sample, np.round(sample)):
@@ -1299,10 +1361,12 @@ def detect_lineage_mixing(
     logger.info("detect_lineage_mixing: %d groups, %d lineages, %d panel genes.", n_groups, len(lineages), panel.size)
 
     # ---- pass 2: panel counts for every cell ----
-    if sparse.issparse(M) and isinstance(M, (sparse.csr_matrix, sparse.csr_array)):
+    if rows is None and sparse.issparse(M) and isinstance(M, (sparse.csr_matrix, sparse.csr_array)):
         Xp = sparse.csr_matrix(M[:, panel], dtype=np.float64)
     else:
-        Xp = sparse.vstack([block[:, panel] for _, _, block in _iter_row_chunks(M, chunk_size)], format="csr").astype(np.float64)
+        Xp = sparse.vstack(
+            [block[:, panel] for _, _, block in _iter_row_chunks(M, chunk_size, rows)], format="csr"
+        ).astype(np.float64)
     panel_fraction = np.asarray(Xp.sum(1)).ravel() / np.maximum(totals, 1.0)
 
     # ---- reference refinement on the purest cells of each group ----
@@ -1335,7 +1399,8 @@ def detect_lineage_mixing(
     foreign_weights = np.where(own_mask, -1.0, W)
     top_idx = foreign_weights.argmax(1)
     top_weight = np.where(scored, foreign_weights.max(1), np.nan)
-    top = pd.Categorical(np.where(scored, groups[top_idx], None), categories=groups)
+    top_label = np.where(scored, groups[top_idx], None)
+    top = pd.Categorical(top_label, categories=groups)
 
     # convert panel-UMI weights to total-RNA fractions with each profile's panel share
     core_cells = ref_idx[core >= 0]
@@ -1375,16 +1440,17 @@ def detect_lineage_mixing(
         has_log_lr = ~np.isnan(log_lr)
         source[has_log_lr] = np.where(log_lr[has_log_lr] > 0, "doublet", "ambient")
 
-    # ---- write outputs ----
-    adata.obs[f"{key_added}_UMI_frac"] = umi_frac.astype(np.float32)
-    adata.obs[f"{key_added}_RNA_frac"] = rna_frac.astype(np.float32)
-    adata.obs[f"{key_added}_top"] = top
-    adata.obs[f"{key_added}_top_weight"] = top_weight.astype(np.float32)
-    adata.obs[f"{key_added}_flag"] = flag.astype(int)
+    # ---- write outputs (into the parent AnnData when `adata` is a view) ----
+    target, expand = _result_target(adata)
+    target.obs[f"{key_added}_UMI_frac"] = expand(umi_frac.astype(np.float32), np.nan)
+    target.obs[f"{key_added}_RNA_frac"] = expand(rna_frac.astype(np.float32), np.nan)
+    target.obs[f"{key_added}_top"] = pd.Categorical(expand(top_label, None), categories=groups)
+    target.obs[f"{key_added}_top_weight"] = expand(top_weight.astype(np.float32), np.nan)
+    target.obs[f"{key_added}_flag"] = expand(flag.astype(int), 0)
     if library_key is not None:
-        adata.obs[f"{key_added}_source"] = pd.Categorical(source, categories=["doublet", "ambient"])
-        adata.obs[f"{key_added}_doublet_logLR"] = log_lr.astype(np.float32)
-    adata.obsm[f"{key_added}_weights"] = W.astype(np.float32)
+        target.obs[f"{key_added}_source"] = pd.Categorical(expand(source, None), categories=["doublet", "ambient"])
+        target.obs[f"{key_added}_doublet_logLR"] = expand(log_lr.astype(np.float32), np.nan)
+    target.obsm[f"{key_added}_weights"] = expand(W.astype(np.float32), np.nan)
 
     summary_by = groupby if summary_by is None else summary_by
     frame = pd.DataFrame(
@@ -1422,7 +1488,7 @@ def detect_lineage_mixing(
         )
         library_summary = library_summary.reset_index()
 
-    adata.uns[key_added] = {
+    target.uns[key_added] = {
         "groupby": groupby,
         "threshold": float(threshold),
         "groups": groups.astype(str),
@@ -1434,10 +1500,11 @@ def detect_lineage_mixing(
         "group_summary": summary,
     }
     if lineage_key is not None:
-        adata.uns[key_added]["lineage_key"] = lineage_key
+        target.uns[key_added]["lineage_key"] = lineage_key
     if library_summary is not None:
-        adata.uns[key_added]["library_key"] = library_key
-        adata.uns[key_added]["library_summary"] = library_summary
+        target.uns[key_added]["library_key"] = library_key
+        target.uns[key_added]["library_summary"] = library_summary
+    _refresh_view(adata)
 
     logger.info(
         "detect_lineage_mixing: flagged %d of %d scored cells (%.2f%%) in %.1fs.",

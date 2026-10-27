@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 import anndata as ad
@@ -72,6 +74,29 @@ class DetectOutliersTests(unittest.TestCase):
         self.assertEqual(int(adata.obs["outlier"].sum()), 0)
         self.assertEqual(summary.loc[0, "method"], "skipped")
         self.assertTrue((adata.obs["outlier_method"] == "skipped_small_group").all())
+
+    def test_view_writes_results_to_parent(self):
+        for backed in (False, True):
+            with self.subTest(backed=backed), tempfile.TemporaryDirectory() as tmp:
+                adata = self._make_adata()
+                adata.obs["keep"] = [True] * 25 + [False] * 5 + [True]
+                if backed:
+                    path = os.path.join(tmp, "outliers.h5ad")
+                    adata.write_h5ad(path)
+                    adata = ad.read_h5ad(path, backed="r")
+                view = adata[adata.obs["keep"]]
+
+                sct.tl.detect_outliers(view, method="dbscan", dbscan_eps=0.25, dbscan_min_samples=5, min_group_size=2)
+
+                dropped = ~adata.obs["keep"]
+                self.assertEqual(int(adata.obs.loc["cell30", "outlier"]), 1)
+                self.assertEqual(int(adata.obs["outlier"].sum()), 1)
+                self.assertTrue((adata.obs.loc[dropped, "outlier_method"] == "unassigned").all())
+                self.assertEqual(adata.uns["outlier_detection"]["n_cells"], view.n_obs)
+                self.assertTrue(view.is_view)
+                self.assertEqual(int(view.obs.loc["cell30", "outlier"]), 1)
+                if backed:
+                    adata.file.close()
 
 
 if __name__ == "__main__":
