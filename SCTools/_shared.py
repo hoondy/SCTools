@@ -230,7 +230,7 @@ def _write_raw_annotations(target, src, subset_var=None):
     raw_var = read_elem(src["raw/var"])
     if subset_var is not None:
         raw_var = raw_var.iloc[np.asarray(subset_var)]
-    write_elem(target, "raw/var", raw_var)
+    write_elem(target.require_group("raw"), "var", raw_var)
 
     if "varm" in src["raw"]:
         raw_varm = read_elem(src["raw/varm"])
@@ -239,7 +239,7 @@ def _write_raw_annotations(target, src, subset_var=None):
                 key: np.asarray(value)[np.asarray(subset_var)]
                 for key, value in raw_varm.items()
             }
-        write_elem(target, "raw/varm", raw_varm)
+        write_elem(target.require_group("raw"), "varm", raw_varm)
 
     return raw_var.shape[0]
 
