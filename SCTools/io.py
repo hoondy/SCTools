@@ -242,7 +242,7 @@ def ondisk_subset(orig_h5ad, new_h5ad, subset_obs, subset_var=None, chunk_size=5
             if raw and "raw" in src:
                 raw_n_vars = _write_raw_annotations(target, src, subset_var=subset_var)
                 if raw_n_vars is not None:
-                    write_elem(target, "raw/X", _empty_csr(raw_n_vars))
+                    write_elem(target.require_group("raw"), "X", _empty_csr(raw_n_vars))
 
     with h5py.File(orig_h5ad, "r") as f:
         _require_csr_group(f["X"], label="`orig_h5ad/X`")

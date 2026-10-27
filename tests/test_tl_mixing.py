@@ -188,5 +188,31 @@ class DetectLineageMixingTests(unittest.TestCase):
                 np.testing.assert_allclose(backed.obs["mixing_UMI_frac"], adata.obs["mixing_UMI_frac"], atol=1e-6)
                 self.assertGreater(int(backed.obs["mixing_flag"].sum()), 0)
 
+    def test_backed_view_writes_results_to_parent(self):
+        adata = _make_adata(n_pure=60, n_doublet=10, n_ambient=0, n_opc_oligo=0)
+        adata.raw = adata
+        keep = (adata.obs["subclass"] != "IN").to_numpy()
+        for use_raw in (True, False):
+            with self.subTest(use_raw=use_raw), tempfile.TemporaryDirectory() as tmp:
+                params = dict(lineage_key="class", use_raw=use_raw, n_markers=20, chunk_size=37)
+                subset = adata[keep].copy()
+                sct.tl.detect_lineage_mixing(subset, **params)
+                path = os.path.join(tmp, "counts.h5ad")
+                adata.write_h5ad(path)
+                backed = ad.read_h5ad(path, backed="r")
+                view = backed[keep]
+                sct.tl.detect_lineage_mixing(view, **params)
+
+                np.testing.assert_allclose(
+                    backed.obs.loc[keep, "mixing_UMI_frac"], subset.obs["mixing_UMI_frac"], atol=1e-6
+                )
+                self.assertTrue(backed.obs.loc[~keep, "mixing_UMI_frac"].isna().all())
+                self.assertEqual(int(backed.obs.loc[~keep, "mixing_flag"].sum()), 0)
+                self.assertGreater(int(backed.obs["mixing_flag"].sum()), 0)
+                self.assertEqual(backed.obsm["mixing_weights"].shape[0], backed.n_obs)
+                self.assertIn("mixing", backed.uns)
+                self.assertIn("mixing_flag", view.obs)
+                backed.file.close()
+
 if __name__ == "__main__":
     unittest.main()
