@@ -316,5 +316,37 @@ class ScanpyHVFH5ADMemoryTests(unittest.TestCase):
         self.assertTrue(all(ref() is None for ref in self.scanpy.adata_refs))
 
 
+class ScanpyHVFH5ADMinCellsTests(unittest.TestCase):
+    """Runs real Scanpy on a small H5AD where 30% of the genes have no counts."""
+
+    def setUp(self):
+        try:
+            pp._require_scanpy()
+        except ImportError:
+            self.skipTest("scanpy is not installed")
+
+        rng = np.random.default_rng(0)
+        counts = np.zeros((40, 100), dtype=np.float32)
+        counts[:, 30:] = rng.poisson(rng.uniform(0.1, 5.0, size=70), size=(40, 70))
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".h5ad")
+        ad.AnnData(
+            sparse.csr_matrix(np.log1p(counts)),
+            var=pd.DataFrame(index=[f"gene{i}" for i in range(100)]),
+        ).write_h5ad(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.close()
+
+    def test_cell_ranger_fails_on_unexpressed_genes_without_min_cells(self):
+        with self.assertRaisesRegex(ValueError, "Bin edges must be unique"):
+            pp.scanpy_hvf_h5ad(self.tmp.name, flavor="cell_ranger", n_top_genes=10)
+
+    def test_min_cells_drops_unexpressed_genes_before_cell_ranger(self):
+        features = pp.scanpy_hvf_h5ad(self.tmp.name, flavor="cell_ranger", n_top_genes=10, min_cells=1)
+
+        self.assertGreaterEqual(len(features), 10)
+        self.assertTrue(all(int(name[4:]) >= 30 for name in features))
+
+
 if __name__ == "__main__":
     unittest.main()

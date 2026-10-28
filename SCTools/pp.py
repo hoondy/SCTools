@@ -230,6 +230,14 @@ def _materialize_scanpy_hvf_h5ad(h5ad_file, backed_adata, var_mask, *, use_raw):
     return ad.AnnData(x, obs=obs, var=var, uns=uns)
 
 
+def _n_cells_per_gene(x):
+    """Count the cells with a non-zero value in each column of `x` (drops explicit zeros of a sparse `x` in place)."""
+    if sparse.issparse(x):
+        x.eliminate_zeros()
+        return np.asarray(x.getnnz(axis=0)).ravel()
+    return np.count_nonzero(np.asarray(x), axis=0)
+
+
 def scanpy_hvf_h5ad(
     h5ad_file,
     flavor="cell_ranger",
@@ -242,8 +250,16 @@ def scanpy_hvf_h5ad(
     protein_coding=False,
     autosome=False,
     plot=False,
+    min_cells=None,
 ):
-    """Return highly variable genes from an H5AD using Scanpy."""
+    """Return highly variable genes from an H5AD using Scanpy.
+
+    If `min_cells` is set, genes with a non-zero value in fewer than
+    `min_cells` cells are left out before selection. `min_cells=1` keeps
+    `flavor="cell_ranger"` working on small subsets: when about 15% or more
+    of the genes have no counts, their identical zero means give duplicate
+    mean-bin edges and Scanpy raises "Bin edges must be unique".
+    """
     sc = _require_scanpy()
 
     backed_adata = None
@@ -270,6 +286,12 @@ def scanpy_hvf_h5ad(
         if flavor == "seurat_v3":
             if n_top_genes is None:
                 raise ValueError("`n_top_genes` is mandatory if `flavor` is `seurat_v3`.")
+
+        if min_cells is not None:
+            expressed = _n_cells_per_gene(adata.X) >= min_cells
+            print("drop %d genes expressed in fewer than %d cells" % (np.sum(~expressed), min_cells))
+            if not expressed.all():
+                adata = adata[:, expressed].copy()
 
         print("scanpy hvg")
         hvg = sc.pp.highly_variable_genes(
