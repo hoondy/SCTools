@@ -811,13 +811,48 @@ def pls_score(
 ) -> dict:
     """Per-cell disease pseudotime via donor-grouped PLS with out-of-fold scoring.
 
-    Intended to be run on an already-subsetted AnnData (e.g. one cell type). `y` is
-    a donor-level quantitative phenotype (Braak, CERAD, PRS, continuous biomarker).
-    Returns a dict of diagnostics; writes:
-      - data.obs[score_key]              cell score in [0, 1] (rank of PLS1, NaN if excluded)
-      - data.obsm[oof_components_key]    (n_cells, n_components) out-of-fold components
-      - data.uns[loadings_key]           gene loadings from the full-data fit
-      - data.uns[weights_key]            x_weights_ from the full-data fit (for projection)
+    Run this on an AnnData already subset to one cell type. Each cell is scored
+    by a model fitted without its donor, so the score is not fitted to the cell
+    it describes.
+
+    Parameters
+    ----------
+    data
+        AnnData subset to one cell type.
+    y
+        ``.obs`` column with a donor-level quantitative phenotype, such as
+        Braak stage, CERAD score, a polygenic risk score, or a continuous
+        biomarker.
+    donor_key
+        ``.obs`` column identifying each cell's donor; cross-validation folds
+        never split a donor.
+    covariates
+        ``.obs`` columns regressed out of the expression matrix within each
+        training fold. Categorical columns are one-hot encoded.
+    n_permutations
+        Number of donor-level shuffles of ``y`` for the permutation test.
+        0 skips the test.
+
+    Writes
+    ------
+    - ``data.obs[score_key]``: cell score in [0, 1], the rank of PLS1; NaN for
+      cells without a finite ``y`` or a donor.
+    - ``data.obsm[oof_components_key]``: ``(n_cells, n_components)``
+      out-of-fold components.
+    - ``data.uns[loadings_key]``: gene loadings from the full-data fit.
+    - ``data.uns[weights_key]``: ``x_weights_`` from the full-data fit, for
+      projecting new data.
+
+    Returns
+    -------
+    Dict of diagnostics:
+
+    - ``pearson_r_pls1_y``: correlation of out-of-fold PLS1 with ``y``.
+    - ``between_donor_variance_fraction``: share of PLS1 variance between
+      donors. Above 0.8, PLS1 mostly separates donors, not disease states.
+    - ``within_donor_variance_mean``: mean PLS1 variance within a donor.
+    - ``permutation_p``: permutation p-value, or None if the test did not run.
+    - ``n_cells_scored``, ``n_donors``, ``n_components``, ``n_splits``.
     """
     PLSRegression = _require_pls_regression()
     _require_group_kfold()  # fail fast if sklearn is missing
