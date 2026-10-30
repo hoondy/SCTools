@@ -6,6 +6,7 @@ from ._shared import (
     _empty_csr,
     _matrix_shape,
     _require_csr_group,
+    _require_sparse_group,
     _skip_anndata_index_checks,
     _write_raw_annotations,
     ad,
@@ -152,21 +153,54 @@ def read_everything_but_X(pth) -> ad.AnnData:
     return adata
 
 
-def csc2csr_on_disk(input_pth, output_pth):
-    """Convert an H5AD stored in CSC format to CSR on disk."""
+def _convert_sparse_on_disk(input_pth, output_pth, src_format, raw):
+    """Rewrite an H5AD with `X`, and `raw/X` if `raw`, switched between CSC and CSR."""
+    keys = ["X"]
+    with h5py.File(input_pth, "r") as src:
+        if raw and "raw" in src and "X" in src["raw"]:
+            keys.append("raw/X")
+        for key in keys:
+            _require_sparse_group(src[key], src_format, label=f"`input_pth/{key}`")
+
     annotations = read_everything_but_X(input_pth)
     annotations.write_h5ad(output_pth)
     del annotations
 
+    src_cls, dst_format = (sparse.csc_matrix, "csr") if src_format == "csc" else (sparse.csr_matrix, "csc")
     with h5py.File(output_pth, "a") as target:
         with h5py.File(input_pth, "r") as src:
-            x_group = src["X"]
-            csc_mat = sparse.csc_matrix(
-                (x_group["data"], x_group["indices"], x_group["indptr"]),
-                shape=_matrix_shape(x_group),
-            )
-            csr_mat = csc_mat.tocsr()
-            write_elem(target, "X", csr_mat)
+            if raw:
+                _write_raw_annotations(target, src)
+            for key in keys:
+                group = src[key]
+                mat = src_cls(
+                    (group["data"], group["indices"], group["indptr"]),
+                    shape=_matrix_shape(group),
+                )
+                dest = target if key == "X" else target.require_group("raw")
+                write_elem(dest, "X", mat.asformat(dst_format))
+                # Free `X` before loading `raw/X`, so only one matrix is in memory at a time.
+                del mat
+
+
+def csc2csr_on_disk(input_pth, output_pth, raw=False):
+    """Convert an H5AD stored in CSC format to CSR on disk.
+
+    Each matrix is converted in memory, which takes about twice its size. With
+    ``raw=True``, ``raw/X`` is converted after ``X`` and ``raw/var`` is kept;
+    otherwise ``raw`` is dropped.
+    """
+    _convert_sparse_on_disk(input_pth, output_pth, "csc", raw)
+
+
+def csr2csc_on_disk(input_pth, output_pth, raw=False):
+    """Convert an H5AD stored in CSR format to CSC on disk.
+
+    Each matrix is converted in memory, which takes about twice its size. With
+    ``raw=True``, ``raw/X`` is converted after ``X`` and ``raw/var`` is kept;
+    otherwise ``raw`` is dropped.
+    """
+    _convert_sparse_on_disk(input_pth, output_pth, "csr", raw)
 
 
 def concat_on_disk(input_pths, output_pth, temp_pth="temp.h5ad"):
@@ -353,6 +387,7 @@ def save(data, filename):
 __all__ = [
     "concat_on_disk",
     "csc2csr_on_disk",
+    "csr2csc_on_disk",
     "ondisk_subset",
     "proc_h5ad",
     "proc_manifest",

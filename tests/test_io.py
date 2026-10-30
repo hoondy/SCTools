@@ -107,6 +107,69 @@ class IOHelpersTests(unittest.TestCase):
         self.assertListEqual(restored.var_names.tolist(), adata.var_names.tolist())
         np.testing.assert_array_equal(restored.X.toarray(), adata.X.toarray())
 
+    def test_csr2csc_on_disk_preserves_annotations(self):
+        source = self.tmp / "csr_source.h5ad"
+        output = self.tmp / "csc_output.h5ad"
+        adata = self._make_adata(matrix_format="csr")
+        adata.write_h5ad(source)
+
+        sct.io.csr2csc_on_disk(source, output)
+
+        with h5py.File(output, "r") as handle:
+            self.assertEqual(_encoding_type(handle["X"]), "csc_matrix")
+
+        restored = ad.read_h5ad(output)
+        self.assertListEqual(restored.obs_names.tolist(), adata.obs_names.tolist())
+        self.assertListEqual(restored.var_names.tolist(), adata.var_names.tolist())
+        np.testing.assert_array_equal(restored.X.toarray(), adata.X.toarray())
+
+    def test_sparse_conversion_converts_raw_when_requested(self):
+        for convert, src_format, dst_encoding in [
+            (sct.io.csc2csr_on_disk, "csc", "csr_matrix"),
+            (sct.io.csr2csc_on_disk, "csr", "csc_matrix"),
+        ]:
+            with self.subTest(convert=convert.__name__):
+                source = self.tmp / f"{src_format}_raw_source.h5ad"
+                output = self.tmp / f"{src_format}_raw_output.h5ad"
+                adata = self._make_adata(matrix_format=src_format)
+                adata.X = adata.X * 2
+                adata.write_h5ad(source)
+
+                convert(source, output, raw=True)
+
+                with h5py.File(output, "r") as handle:
+                    self.assertEqual(_encoding_type(handle["X"]), dst_encoding)
+                    self.assertEqual(_encoding_type(handle["raw/X"]), dst_encoding)
+                restored = ad.read_h5ad(output)
+                np.testing.assert_array_equal(restored.X.toarray(), adata.X.toarray())
+                np.testing.assert_array_equal(restored.raw.X.toarray(), adata.raw.X.toarray())
+                self.assertListEqual(restored.raw.var_names.tolist(), adata.raw.var_names.tolist())
+
+    def test_sparse_conversion_drops_raw_by_default(self):
+        for convert, src_format in [(sct.io.csc2csr_on_disk, "csc"), (sct.io.csr2csc_on_disk, "csr")]:
+            with self.subTest(convert=convert.__name__):
+                source = self.tmp / f"{src_format}_source.h5ad"
+                output = self.tmp / f"{src_format}_output.h5ad"
+                self._make_adata(matrix_format=src_format).write_h5ad(source)
+
+                convert(source, output)
+
+                self.assertIsNone(ad.read_h5ad(output).raw)
+
+    def test_sparse_conversion_rejects_wrong_input_format(self):
+        for convert, wrong_format, expected in [
+            (sct.io.csc2csr_on_disk, "csr", "CSC"),
+            (sct.io.csr2csc_on_disk, "csc", "CSR"),
+        ]:
+            with self.subTest(convert=convert.__name__):
+                source = self.tmp / f"{wrong_format}_wrong_source.h5ad"
+                output = self.tmp / f"{wrong_format}_wrong_output.h5ad"
+                self._make_adata(matrix_format=wrong_format).write_h5ad(source)
+
+                with self.assertRaisesRegex(ValueError, expected):
+                    convert(source, output, raw=True)
+                self.assertFalse(output.exists())
+
     def test_concat_on_disk_combines_inputs(self):
         first = self.tmp / "first.h5ad"
         second = self.tmp / "second.h5ad"
