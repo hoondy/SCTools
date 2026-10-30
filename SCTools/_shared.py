@@ -183,15 +183,19 @@ def _get_autosome_mask(var):
     return ~var["gene_chrom"].isin(["MT", "X", "Y"]).to_numpy()
 
 
-def _require_csr_group(group, *, label):
+def _require_sparse_group(group, fmt, *, label):
     encoding = group.attrs.get("encoding-type")
     if isinstance(encoding, bytes):
         encoding = encoding.decode()
-    if encoding != "csr_matrix":
+    if encoding != f"{fmt}_matrix":
         raise ValueError(
-            f"{label} must be stored as a CSR sparse matrix. "
+            f"{label} must be stored as a {fmt.upper()} sparse matrix. "
             f"Found encoding-type={encoding!r}."
         )
+
+
+def _require_csr_group(group, *, label):
+    _require_sparse_group(group, "csr", label=label)
 
 
 def _matrix_shape(group):

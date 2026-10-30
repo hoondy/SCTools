@@ -45,9 +45,9 @@ for example `sct.io.read_everything_but_X(...)`, not
 | `ondisk_subset` | Write a subset of cells and genes to a new file, copying `X` in chunks |
 | `write_h5ad_with_new_annotation` | Save edited annotations together with the original file's `X` |
 | `concat_on_disk` | Concatenate several files, appending each matrix on disk |
-| `csc2csr_on_disk` | Rewrite a file whose `X` is stored as CSC with a CSR `X` |
+| `csc2csr_on_disk`, `csr2csc_on_disk` | Rewrite a file with its `X` converted from CSC to CSR, or from CSR to CSC; pass `raw=True` to convert `raw/X` too |
 | `save` | Convert a Pegasus object to AnnData and write it |
-| `proc_h5ad_v2`, `proc_h5ad_v3`, `proc_manifest` | Import files from one project's pipeline; they expect specific `obs` columns such as `SubID_cs` and `rep` |
+| `proc_h5ad`, `proc_manifest` | Prepare demultiplexed per-pool files, such as vireoSNP output, for concatenation: keep and rename chosen `obs` columns, prefix barcodes with the channel so they don't clash across pools, and optionally align genes to a template. The column names are arguments; the defaults (`SubID_vS`, `rep`, ...) match one project's pipeline. `proc_manifest` runs `proc_h5ad` over a CSV of file paths and writes the results in chunks |
 
 See [Working with large H5AD files](#working-with-large-h5ad-files) for examples.
 
@@ -112,7 +112,8 @@ sct.io.ondisk_subset("atlas.h5ad", "microglia.h5ad", subset_obs=is_microglia, ra
 
 - `ondisk_subset` takes a boolean mask over cells for `subset_obs`, and requires
   `X` to be stored as CSR. To convert a CSC file, use `csc2csr_on_disk`. It
-  loads the whole matrix, so it needs enough memory to hold it.
+  converts the matrix in memory, which takes about twice the matrix's size.
+  With `raw=True`, `raw/X` is converted after `X`, one matrix at a time.
 - `write_h5ad_with_new_annotation` copies `X` unchanged. The AnnData you pass
   must have the same cells and genes, in the same order, as the original file.
 
@@ -393,6 +394,8 @@ SCTools began as a standalone script. Packaging it fixed these issues:
 - `mark_MitoCarta` takes the reference file as `mitocarta_path=` instead of
   depending on one hard-coded file path. Without the argument it still falls
   back to that path, and raises `FileNotFoundError` if the file is not there.
+- `proc_h5ad_v2` and `proc_h5ad_v3` are merged into `proc_h5ad`, which takes
+  the column names as arguments and no longer modifies `dummy_adata`.
 
 ## Development
 
