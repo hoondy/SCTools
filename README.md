@@ -47,7 +47,7 @@ for example `sct.io.read_everything_but_X(...)`, not
 | `concat_on_disk` | Concatenate several files, appending each matrix on disk |
 | `csc2csr_on_disk` | Rewrite a file whose `X` is stored as CSC with a CSR `X` |
 | `save` | Convert a Pegasus object to AnnData and write it |
-| `proc_h5ad_v2`, `proc_h5ad_v3`, `proc_manifest` | Import files from one project's pipeline; they expect specific `obs` columns such as `SubID_cs` and `rep` |
+| `proc_h5ad`, `proc_manifest` | Prepare demultiplexed per-pool files, such as vireoSNP output, for concatenation: keep and rename chosen `obs` columns, prefix barcodes with the channel so they don't clash across pools, and optionally align genes to a template. The column names are arguments; the defaults (`SubID_vS`, `rep`, ...) match one project's pipeline. `proc_manifest` runs `proc_h5ad` over a CSV of file paths and writes the results in chunks |
 
 See [Working with large H5AD files](#working-with-large-h5ad-files) for examples.
 
@@ -393,6 +393,8 @@ SCTools began as a standalone script. Packaging it fixed these issues:
 - `mark_MitoCarta` takes the reference file as `mitocarta_path=` instead of
   depending on one hard-coded file path. Without the argument it still falls
   back to that path, and raises `FileNotFoundError` if the file is not there.
+- `proc_h5ad_v2` and `proc_h5ad_v3` are merged into `proc_h5ad`, which takes
+  the column names as arguments and no longer modifies `dummy_adata`.
 
 ## Development
 

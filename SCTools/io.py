@@ -20,61 +20,100 @@ from ._shared import (
 )
 
 
-def proc_h5ad_v2(filepath):
-    """Normalize selected observation and variable annotations in an H5AD."""
+# Default `obs` columns kept by `proc_h5ad` (input name -> output name), matching
+# vireoSNP-demultiplexed pools that also carry hashtag (`_cs`) calls.
+_PROC_H5AD_OBS_COLUMNS = {
+    "SubID_vS": "SubID",
+    "rep": "rep",
+    "poolID_ref": "poolID",
+    "round_num": "round_num",
+    "prep": "prep",
+    "SubID_cs": "SubID_cs",
+    "HTO_n_cs": "HTO_n_cs",
+    "max_prob": "max_prob",
+    "doublet_prob": "doublet_prob",
+}
+
+
+def proc_h5ad(
+    filepath,
+    dummy_adata=None,
+    subject_col="SubID_vS",
+    rep_col="rep",
+    obs_columns=None,
+    source_col="Source",
+):
+    """Harmonize the annotations of one demultiplexed pool H5AD.
+
+    Adds ``obs["Channel"]`` as ``"<subject>-<rep>"`` and renames each cell to
+    ``"<Channel>-<barcode>"``, so cells that share a 10x barcode in different
+    pools stay distinct after concatenation. Only the ``obs`` columns in
+    ``obs_columns`` are kept, and ``"_index"`` is removed from gene names.
+
+    Parameters
+    ----------
+    filepath
+        H5AD file to read.
+    dummy_adata
+        Optional AnnData with no cells, whose genes form the gene set of every
+        output. When given, the result is outer-joined to these genes, which
+        must come out sorted, and ``X`` gets int64 indices so that many
+        outputs can be concatenated. ``dummy_adata`` is not modified.
+    subject_col, rep_col
+        ``obs`` columns joined to form ``Channel``.
+    obs_columns
+        ``obs`` columns to keep, as a dict of input name to output name, or a
+        list to keep the names unchanged. Defaults to ``SubID_vS`` (as
+        ``SubID``), ``rep``, ``poolID_ref`` (as ``poolID``), ``round_num``,
+        ``prep``, ``SubID_cs``, ``HTO_n_cs``, ``max_prob`` and
+        ``doublet_prob``.
+    source_col
+        Output column for the first character of each subject ID. Set to
+        ``None`` to skip it.
+    """
+    if obs_columns is None:
+        obs_columns = _PROC_H5AD_OBS_COLUMNS
+    elif not isinstance(obs_columns, dict):
+        obs_columns = {col: col for col in obs_columns}
+
     with _skip_anndata_index_checks():
         adata = ad.read_h5ad(filepath)
 
-    adata.obs["Channel"] = [x[0] + "-" + x[1] for x in zip(adata.obs.SubID_cs, adata.obs.rep)]
-    adata.obs = adata.obs[["Channel", "SubID_cs", "round_num", "batch", "prep", "rep", "HTO_n_cs"]]
-    adata.obs.columns = ["Channel", "SubID", "round_num", "batch", "prep", "rep", "HTO"]
-    adata.obs.batch = [x.replace("-cDNA", "") for x in adata.obs.batch]
-    adata.obs["barcodekey"] = [x[0] + "-" + x[1] for x in zip(adata.obs.Channel, adata.obs.index)]
-    adata.obs.index = adata.obs.barcodekey
-    del adata.obs["barcodekey"]
-    adata.obs["Source"] = [x[0] for x in adata.obs.SubID.tolist()]
+    missing = [col for col in dict.fromkeys([subject_col, rep_col, *obs_columns]) if col not in adata.obs]
+    if missing:
+        raise KeyError(f"`obs` of {filepath} is missing columns: {missing}.")
+
+    subject = adata.obs[subject_col].astype(str)
+    channel = subject + "-" + adata.obs[rep_col].astype(str)
+
+    obs = adata.obs[list(obs_columns)].rename(columns=obs_columns)
+    obs.insert(0, "Channel", channel)
+    if source_col is not None:
+        obs[source_col] = subject.str[0]
+    obs.index = pd.Index([x[0] + "-" + x[1] for x in zip(channel, adata.obs_names)], name="barcodekey")
+    adata.obs = obs
 
     adata.var.index = [x.replace("_index", "") for x in adata.var.index]
+
+    if dummy_adata is not None:
+        with _skip_anndata_index_checks():
+            adata = ad.concat([dummy_adata, adata], join="outer", merge="same")
+        adata.X.sort_indices()
+
+        if adata.var_names.to_list() != sorted(adata.var_names):
+            raise AssertionError("Expected concatenated `var_names` to be sorted.")
+
+        adata.X.indptr = adata.X.indptr.astype(np.int64)
+        adata.X.indices = adata.X.indices.astype(np.int64)
 
     return adata
 
 
-def proc_h5ad_v3(filepath, dummy_adata):
-    """Read an individual H5AD and align its variables to a dummy template."""
-    dummy_adata.X.indptr = dummy_adata.X.indptr.astype(np.int64)
-    dummy_adata.X.indices = dummy_adata.X.indices.astype(np.int64)
+def proc_manifest(manifest_file, prefix, postfix, chunk_size, dummy_adata, **kwargs):
+    """Process manifest rows in chunks and write chunked H5AD outputs.
 
-    with _skip_anndata_index_checks():
-        adata = ad.read_h5ad(filepath)
-
-    adata.obs["Channel"] = [x[0] + "-" + x[1] for x in zip(adata.obs.SubID_vS, adata.obs.rep)]
-    adata.obs = adata.obs[
-        ["Channel", "SubID_vS", "rep", "poolID_ref", "round_num", "prep", "SubID_cs", "HTO_n_cs", "max_prob", "doublet_prob"]
-    ]
-    adata.obs.columns = ["Channel", "SubID", "rep", "poolID", "round_num", "prep", "SubID_cs", "HTO_n_cs", "max_prob", "doublet_prob"]
-    adata.obs["Source"] = [x[0] for x in adata.obs.SubID.tolist()]
-
-    adata.obs["barcodekey"] = [x[0] + "-" + x[1] for x in zip(adata.obs.Channel, adata.obs.index)]
-    adata.obs.index = adata.obs.barcodekey
-    del adata.obs["barcodekey"]
-
-    adata.var.index = [x.replace("_index", "") for x in adata.var.index]
-
-    with _skip_anndata_index_checks():
-        adata = ad.concat([dummy_adata, adata], join="outer", merge="same")
-    adata.X.sort_indices()
-
-    if adata.var_names.to_list() != sorted(adata.var_names):
-        raise AssertionError("Expected concatenated `var_names` to be sorted.")
-
-    adata.X.indptr = adata.X.indptr.astype(np.int64)
-    adata.X.indices = adata.X.indices.astype(np.int64)
-
-    return adata
-
-
-def proc_manifest(manifest_file, prefix, postfix, chunk_size, dummy_adata):
-    """Process manifest rows in chunks and write chunked H5AD outputs."""
+    Each file is read with `proc_h5ad`; extra keyword arguments are passed to it.
+    """
     list_h5ad_parts = []
     df = pd.read_csv(manifest_file)
     chunks = [df.Location[i : i + chunk_size] for i in range(0, len(df.Location), chunk_size)]
@@ -83,7 +122,7 @@ def proc_manifest(manifest_file, prefix, postfix, chunk_size, dummy_adata):
         list_adata = []
         for filepath in list_filepath:
             print(filepath)
-            list_adata.append(proc_h5ad_v3(filepath, dummy_adata))
+            list_adata.append(proc_h5ad(filepath, dummy_adata, **kwargs))
 
         outfilename = prefix + "_raw_" + postfix + str((j + 1)) + ".h5ad"
 
@@ -315,8 +354,7 @@ __all__ = [
     "concat_on_disk",
     "csc2csr_on_disk",
     "ondisk_subset",
-    "proc_h5ad_v2",
-    "proc_h5ad_v3",
+    "proc_h5ad",
     "proc_manifest",
     "read_everything_but_X",
     "save",
