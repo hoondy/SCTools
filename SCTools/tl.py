@@ -1172,6 +1172,94 @@ def _fit_mixture_weights(X, P, max_iter=300, tol=1e-4, chunk_size=20000, extra=N
     return W, loglik
 
 
+def _lineage_nuclei(
+    W, n_panel, codes, umi_frac, group_lineage, lineages, library_codes, n_libraries, core_quantile, min_cells,
+    max_iter=100, tol=1e-6,
+):
+    """Per-cell RNA of each lineage in nucleus equivalents.
+
+    A group's typical cells are the ``1 - core_quantile`` of its cells with the lowest
+    ``umi_frac``. Their panel UMIs are modelled as (group size) x (library depth) and both
+    factors are fitted jointly by alternating medians on the log scale (median polish), so
+    a group whose cells sit mostly in deep libraries is not mistaken for a large one.
+    Depth is relative to the median library; it is 1 without ``library_codes`` and for
+    libraries with fewer than ``min_cells`` typical cells. Group ``k`` adds
+    ``W[:, k] * n_panel / (size[k] * depth)`` nuclei to its lineage. Returns the
+    (cells x lineages) amounts, the typical panel UMIs per group in the median library, and
+    the depth factor per library (None without ``library_codes``).
+    """
+    n_obs, n_groups = W.shape
+
+    # Typical cells define "one nucleus" of each group: the purest (1 - core_quantile) of the
+    # group by foreign share, chosen across all libraries at once. Cells carrying extra material
+    # have more UMIs and a higher share, so they drop out. (Choosing the purest cells within each
+    # library instead shifts the depth of libraries with unusual ambient RNA, and was less
+    # accurate in testing.)
+    is_typical = np.zeros(n_obs, dtype=bool)
+    for k in range(n_groups):
+        members = np.where(codes == k)[0]
+        if members.size:
+            is_typical[members[umi_frac[members] <= np.quantile(umi_frac[members], 1 - core_quantile)]] = True
+
+    # Model for typical cells, on the log scale:
+    #   log(panel UMIs) = log(size of its group) + log(depth of its library) + noise.
+    # Cells without a library (code -1) and cells without panel UMIs are left out of the fit.
+    use = is_typical & (n_panel > 0)
+    if library_codes is not None:
+        use &= library_codes >= 0
+    y, g = np.log(n_panel[use]), codes[use]
+
+    def group_medians(values):
+        # a group without usable typical cells gets the median group size, not 1 UMI
+        medians = pd.Series(values).groupby(g).median().reindex(range(n_groups)).to_numpy()
+        return np.where(np.isnan(medians), np.nanmedian(medians) if np.isfinite(medians).any() else 0.0, medians)
+
+    # Starting point: each group's median over all libraries pooled. On its own this is the
+    # one-pass estimate. It is biased when a group's cells sit mostly in deep (or shallow)
+    # libraries, because the pooled median then also measures depth: in brain tissue,
+    # glia-rich libraries tend to be sequenced deeper, so glia look larger than they are and
+    # attached glial RNA is undercounted.
+    log_size = group_medians(y)
+    library_depth = None
+    depth = np.ones(n_obs)
+    if library_codes is not None:
+        lib = library_codes[use]
+        # Libraries with too few typical cells for a stable median keep depth 1 (the median library).
+        fitted = np.bincount(lib, minlength=n_libraries) >= min_cells
+        log_depth = np.zeros(n_libraries)
+        # Fit size and depth jointly by alternating medians (median polish, i.e. backfitting on
+        # absolute deviations):
+        #   depth of a library = median over its typical cells of (log UMIs - log size of their group)
+        #   size of a group    = median over its typical cells of (log UMIs - log depth of their library)
+        # The first round equals the one-pass estimate; each further round removes the depth that
+        # the pooled group medians had absorbed. At convergence every group and every fitted
+        # library has a median residual of 0. With real (noisy) counts this takes a few dozen
+        # rounds at most and lands on the least-absolute-deviation fit.
+        for _ in range(max_iter):
+            new_depth = pd.Series(y - log_size[g]).groupby(lib).median().reindex(range(n_libraries)).to_numpy()
+            new_depth = np.where(fitted, new_depth, np.nan)
+            # Size and depth are identified only up to a shared constant. Centring depth on the
+            # median fitted library puts sizes in "panel UMIs in the median library" units.
+            new_depth = np.nan_to_num(new_depth - np.nanmedian(new_depth), nan=0.0) if fitted.any() else log_depth
+            new_size = group_medians(y - new_depth[lib])
+            change = max(np.abs(new_depth - log_depth).max(), np.abs(new_size - log_size).max())
+            log_depth, log_size = new_depth, new_size
+            if change < tol:
+                break
+        library_depth = np.exp(log_depth)
+        in_library = library_codes >= 0
+        depth[in_library] = library_depth[library_codes[in_library]]
+    # floor at 1 UMI so a group can never divide by ~0
+    typical = np.maximum(np.exp(log_size), 1.0)
+
+    # Nucleus equivalents: W[:, k] * n_panel is the cell's panel UMIs from group k. Dividing by
+    # the cell's library depth puts them in median-library units, and dividing by typical[k]
+    # counts them in typical nuclei of group k. Summed over the groups of each lineage.
+    amounts = W * (n_panel / depth)[:, None] / typical[None, :]
+    membership = (group_lineage[:, None] == lineages[None, :]).astype(np.float64)
+    return amounts @ membership, typical, library_depth
+
+
 def detect_lineage_mixing(
     adata: ad.AnnData,
     groupby: str = "subclass",
@@ -1180,7 +1268,8 @@ def detect_lineage_mixing(
     layer: str = None,
     use_raw: bool = None,
     library_key: str = None,
-    threshold: float = 0.3,
+    score: str = "UMI_frac",
+    threshold: float = None,
     summary_by=None,
     n_markers: int = 150,
     min_lfc: float = 1.0,
@@ -1207,6 +1296,15 @@ def detect_lineage_mixing(
     the cell's own lineage, i.e. the fraction of the cell's marker-panel UMIs
     attributed to other lineages. Clean cells score close to 0; a doublet of two
     cells with similar panel depth scores around 0.5.
+
+    With ``score="nuclei"``, cells are flagged on the amount of foreign RNA
+    instead of its share: the largest amount from any single other lineage, in
+    nucleus equivalents. 1.0 is the panel RNA of one typical nucleus of that
+    type in the cell's library, so a heterotypic doublet scores about 1 and
+    ambient RNA, spread thinly over all lineages, a few hundredths. The share
+    depends on the size of the host nucleus, so small nuclei with ordinary
+    ambient RNA can pass a share threshold while large nuclei carrying a whole
+    small cell stay below it; the amount does not have that bias.
 
     Reference profiles are built from up to ``max_ref_cells`` cells per group and
     refined ``n_refine`` times on the purest ``1 - core_quantile`` of each group,
@@ -1247,12 +1345,23 @@ def detect_lineage_mixing(
         ``groupby`` labels.
     library_key
         ``.obs`` column identifying each cell's sequencing library (e.g. 10x
-        channel). Cells of one library share one ambient RNA pool, so pass the
-        library rather than a coarser processing batch. Optional: it does not
-        change the foreign score or the flag, but enables the doublet/ambient
-        classification and a per-library summary.
+        channel). Cells of one library share one ambient RNA pool and one
+        sequencing depth, so pass the library rather than a coarser processing
+        batch. It enables the doublet/ambient classification, a per-library
+        summary, and the per-library depth factor of ``{key_added}_nuclei``
+        (recommended with ``score="nuclei"``). It does not change
+        ``{key_added}_UMI_frac``.
+    score
+        Score to flag on: ``"UMI_frac"`` (``{key_added}_UMI_frac``, the share of
+        the cell's marker-panel UMIs from other lineages) or ``"nuclei"``
+        (``{key_added}_nuclei``, the largest amount of RNA from any single
+        other lineage, in nucleus equivalents).
     threshold
-        Cells with ``{key_added}_UMI_frac >= threshold`` are flagged.
+        Cells whose ``score`` is ``>= threshold`` are flagged. Defaults to 0.3
+        for ``"UMI_frac"`` and 0.25 for ``"nuclei"``. A quarter of a nucleus is
+        far above ambient RNA (a few hundredths); in human cortex, nuclei with
+        attached material from another cell carry 0.3-0.6 of a nucleus and
+        heterotypic doublets about 1.
     summary_by
         ``.obs`` column(s) for the returned summary; defaults to ``groupby``. Use a
         finer label such as ``"subtype"`` to find whole clusters to drop.
@@ -1265,15 +1374,32 @@ def detect_lineage_mixing(
         mitochondrial (``MT-``) and ribosomal protein (``RPL``/``RPS``) genes.
     min_group_size
         Groups with fewer cells get no profile; their cells are left unscored.
+        Libraries with fewer typical cells (see ``core_quantile``) get a depth
+        factor of 1.
+    core_quantile
+        References are refined on the purest ``1 - core_quantile`` of each
+        group's reference cells. The same share of each group's scored cells,
+        those with the lowest ``{key_added}_UMI_frac``, are its typical cells.
+        Their panel UMIs are modelled as group size times library depth, fitted
+        jointly by alternating medians, so a group whose cells sit mostly in
+        deep libraries is not mistaken for a large one. One nucleus of a group
+        is its typical panel UMIs scaled to the cell's library.
 
     Writes
     ------
     ``adata.obs``:
 
     - ``{key_added}_UMI_frac``: fraction of the cell's marker-panel UMIs
-      attributed to other lineages; the score used for flagging.
+      attributed to other lineages; the flagging score with
+      ``score="UMI_frac"``.
     - ``{key_added}_RNA_frac``: the same converted to an estimated fraction of
       the cell's total RNA, using each profile's typical panel share.
+    - ``{key_added}_nuclei`` and ``{key_added}_nuclei_lineage``: the largest
+      amount of RNA from any single other lineage, in nucleus equivalents, and
+      that lineage; the flagging score with ``score="nuclei"``. A group's
+      weight times the cell's panel UMIs, divided by the panel UMIs of a
+      typical cell of the group in the median library and, with
+      ``library_key``, by the library's depth factor.
     - ``{key_added}_top`` and ``{key_added}_top_weight``: the
       foreign group with the largest weight, and that weight.
     - ``{key_added}_flag``: 1 if flagged, else 0.
@@ -1282,12 +1408,15 @@ def detect_lineage_mixing(
       log-likelihood ratio behind it (positive favours ``"doublet"``).
 
     ``adata.obsm[f"{key_added}_weights"]``: per-cell weights over groups.
+    ``adata.obsm[f"{key_added}_lineage_nuclei"]``: per-cell nucleus equivalents
+    of every lineage in ``uns[key_added]["lineages"]``, the cell's own included.
     ``adata.uns[key_added]``: parameters, groups, lineages, panel genes,
-    profiles, and summaries.
+    profiles, typical panel UMIs per group, and summaries (with
+    ``library_key``, the per-library summary holds the depth factors).
 
     Returns
     -------
-    Per-``summary_by`` DataFrame with cell counts, median foreign score, flagged
+    Per-``summary_by`` DataFrame with cell counts, median foreign scores, flagged
     fraction, most frequent foreign type among flagged cells, and (with
     ``library_key``) the fraction of flagged cells classified as ``"doublet"``.
     """
@@ -1297,10 +1426,24 @@ def detect_lineage_mixing(
         raise KeyError(f"`lineage_key`={lineage_key!r} not in adata.obs.")
     if library_key is not None and library_key not in adata.obs.columns:
         raise KeyError(f"`library_key`={library_key!r} not in adata.obs.")
-    if not 0 < threshold < 1:
-        raise ValueError("`threshold` must be between 0 and 1.")
+    if score not in ("UMI_frac", "nuclei"):
+        raise ValueError("`score` must be 'UMI_frac' or 'nuclei'.")
+    if threshold is None:
+        # "nuclei": in human cortex the score is bimodal, with ambient-level cells at a few
+        # hundredths of a nucleus and cells carrying attached material at about half a nucleus.
+        # 0.25 sits in the valley between the two.
+        threshold = 0.3 if score == "UMI_frac" else 0.25
+    if score == "UMI_frac" and not 0 < threshold < 1:
+        raise ValueError("`threshold` must be between 0 and 1 with score='UMI_frac'.")
+    if score == "nuclei" and not threshold > 0:
+        raise ValueError("`threshold` must be positive with score='nuclei'.")
     if not 0 <= core_quantile < 1:
         raise ValueError("`core_quantile` must be in [0, 1).")
+    if score == "nuclei" and library_key is None:
+        logger.warning(
+            "detect_lineage_mixing: score='nuclei' without `library_key` uses one depth factor for all cells; "
+            "pass the sequencing library to adjust for differences in depth between libraries."
+        )
 
     start_time = time.perf_counter()
     rng = np.random.default_rng(random_state)
@@ -1402,7 +1545,8 @@ def detect_lineage_mixing(
         Xp = sparse.vstack(
             [block[:, panel] for _, _, block in _iter_row_chunks(M, chunk_size, rows)], format="csr"
         ).astype(np.float64)
-    panel_fraction = np.asarray(Xp.sum(1)).ravel() / np.maximum(totals, 1.0)
+    n_panel = np.asarray(Xp.sum(1)).ravel()
+    panel_fraction = n_panel / np.maximum(totals, 1.0)
 
     # ---- reference refinement on the purest cells of each group ----
     same_lineage = group_lineage[:, None] == group_lineage[None, :]
@@ -1446,14 +1590,51 @@ def detect_lineage_mixing(
     rna /= rna.sum(1, keepdims=True)
     rna_frac = np.where(scored, 1 - (rna * own_mask).sum(1), np.nan)
 
-    flag = scored & (umi_frac >= threshold)
+    # ---- foreign RNA amount: largest single other lineage, in nucleus equivalents ----
+    # umi_frac is a share, so it depends on the host's size. A small host with ordinary ambient
+    # RNA can pass a share cutoff, and a large host carrying a whole small cell can stay below
+    # it. The amount does not have this problem: each group's RNA is counted in typical nuclei
+    # of that group in the cell's library (see _lineage_nuclei) and summed per lineage. The
+    # score is the largest lineage other than the cell's own. Ambient RNA is spread thinly over
+    # all lineages, so no single lineage gets much of it; material from one attached cell is
+    # concentrated in one lineage. Taking the largest single lineage, not the sum of all others,
+    # keeps ambient RNA from adding up across lineages.
+    libraries = library_codes = None
+    if library_key is not None:
+        libraries = adata.obs[library_key].astype("category")
+        library_codes = libraries.cat.codes.to_numpy()
+    lineage_nuclei, typical_panel_umis, library_depth = _lineage_nuclei(
+        W,
+        n_panel,
+        codes,
+        umi_frac,
+        group_lineage,
+        lineages,
+        library_codes,
+        None if libraries is None else len(libraries.cat.categories),
+        core_quantile,
+        min_group_size,
+    )
+    # "own" is the lineage of the cell's label, not the lineage with the most RNA, so a neuron
+    # labelled as glia is scored on its neuronal RNA.
+    own_lineage = scored[:, None] & (lineages[None, :] == cell_lineage[:, None])
+    foreign_nuclei = np.where(own_lineage, 0.0, lineage_nuclei)
+    nuclei = np.where(scored, foreign_nuclei.max(1), np.nan)
+    nuclei_lineage = np.where(scored & (nuclei > 0), lineages[foreign_nuclei.argmax(1)], None)
+    if library_depth is not None:
+        logger.info(
+            "detect_lineage_mixing: library depth factors %.2f-%.2f (median %.2f).",
+            float(library_depth.min()),
+            float(library_depth.max()),
+            float(np.median(library_depth)),
+        )
+
+    flag = scored & ((nuclei if score == "nuclei" else umi_frac) >= threshold)
 
     # ---- doublet-like (one foreign type) vs ambient-like (library pool) foreign signal ----
     log_lr = np.full(n_obs, np.nan)
     source = np.full(n_obs, None, dtype=object)
     if library_key is not None and flag.any():
-        libraries = adata.obs[library_key].astype("category")
-        library_codes = libraries.cat.codes.to_numpy()
         in_library = np.where(library_codes >= 0)[0]
         pool = sparse.csr_matrix(
             (np.ones(in_library.size), (library_codes[in_library], in_library)),
@@ -1479,6 +1660,8 @@ def detect_lineage_mixing(
     target, expand = _result_target(adata)
     target.obs[f"{key_added}_UMI_frac"] = expand(umi_frac.astype(np.float32), np.nan)
     target.obs[f"{key_added}_RNA_frac"] = expand(rna_frac.astype(np.float32), np.nan)
+    target.obs[f"{key_added}_nuclei"] = expand(nuclei.astype(np.float32), np.nan)
+    target.obs[f"{key_added}_nuclei_lineage"] = pd.Categorical(expand(nuclei_lineage, None), categories=lineages)
     target.obs[f"{key_added}_top"] = pd.Categorical(expand(top_label, None), categories=groups)
     target.obs[f"{key_added}_top_weight"] = expand(top_weight.astype(np.float32), np.nan)
     target.obs[f"{key_added}_flag"] = expand(flag.astype(int), 0)
@@ -1486,10 +1669,11 @@ def detect_lineage_mixing(
         target.obs[f"{key_added}_source"] = pd.Categorical(expand(source, None), categories=["doublet", "ambient"])
         target.obs[f"{key_added}_doublet_logLR"] = expand(log_lr.astype(np.float32), np.nan)
     target.obsm[f"{key_added}_weights"] = expand(W.astype(np.float32), np.nan)
+    target.obsm[f"{key_added}_lineage_nuclei"] = expand(lineage_nuclei.astype(np.float32), np.nan)
 
     summary_by = groupby if summary_by is None else summary_by
     frame = pd.DataFrame(
-        {"umi_frac": umi_frac, "flag": flag, "top": top.astype(object), "source": source},
+        {"umi_frac": umi_frac, "nuclei": nuclei, "flag": flag, "top": top.astype(object), "source": source},
         index=adata.obs.index,
     )
     rows = []
@@ -1500,6 +1684,7 @@ def detect_lineage_mixing(
             "group": group_name,
             "n_cells": int(len(sub)),
             "median_UMI_frac": float(sub["umi_frac"].median()),
+            "median_nuclei": float(sub["nuclei"].median()),
             "n_flagged": int(len(flagged)),
             "flag_fraction": float(sub["flag"].mean()) if len(sub) else np.nan,
             "top": flagged["top"].mode().iloc[0] if len(flagged) else None,
@@ -1517,20 +1702,25 @@ def detect_lineage_mixing(
             n_cells=("flag", "size"),
             flag_fraction=("flag", "mean"),
             median_UMI_frac=("umi_frac", "median"),
+            median_nuclei=("nuclei", "median"),
         )
         library_summary["median_UMI_frac_unflagged"] = (
             library_frame[~library_frame["flag"]].groupby("library")["umi_frac"].median()
         )
+        library_summary["depth_factor"] = pd.Series(library_depth, index=libraries.cat.categories.astype(str))
         library_summary = library_summary.reset_index()
 
     target.uns[key_added] = {
         "groupby": groupby,
+        "score": score,
         "threshold": float(threshold),
         "groups": groups.astype(str),
         "group_lineage": group_lineage.astype(str),
+        "lineages": lineages.astype(str),
         "panel_genes": gene_names[panel].to_numpy().astype(str),
         "profiles": P.astype(np.float32),
         "profile_panel_fraction": profile_panel_fraction,
+        "typical_panel_UMIs": typical_panel_umis,
         "n_flagged": int(flag.sum()),
         "group_summary": summary,
     }
@@ -1542,10 +1732,12 @@ def detect_lineage_mixing(
     _refresh_view(adata)
 
     logger.info(
-        "detect_lineage_mixing: flagged %d of %d scored cells (%.2f%%) in %.1fs.",
+        "detect_lineage_mixing: flagged %d of %d scored cells (%.2f%%) with %s >= %g in %.1fs.",
         int(flag.sum()),
         int(scored.sum()),
         100.0 * flag.sum() / max(int(scored.sum()), 1),
+        score,
+        threshold,
         time.perf_counter() - start_time,
     )
     return summary

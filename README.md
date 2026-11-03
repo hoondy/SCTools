@@ -176,6 +176,20 @@ assigned to profiles outside its own lineage:
 - A doublet of two cells with similar panel depth scores around 0.5.
 - Mixtures dominated by the foreign cell type score higher.
 
+A second score, `mixing_nuclei`, measures the amount of foreign RNA instead of
+its share: the largest amount from any single other lineage, in nucleus
+equivalents. 1.0 is the panel RNA of one typical nucleus of that cell type in
+the cell's library:
+
+- Ambient RNA spreads thinly over all lineages and gives a few hundredths.
+- A heterotypic doublet scores about 1.
+- A nucleus carrying part of another cell scores in between.
+
+The share depends on the size of the host nucleus. A small nucleus with
+ordinary ambient RNA can pass a share threshold, while a large nucleus carrying
+a whole small cell stays below it. The amount has neither problem, so flag on
+it with `score="nuclei"`.
+
 The reference profiles are refined on the purest cells of each group, so a
 contaminated minority does not leak into them. The function needs only the base
 install.
@@ -191,9 +205,10 @@ summary = sct.tl.detect_lineage_mixing(
     groupby="subclass",                     # mixture components
     lineage_key="class",                    # mixing within a lineage is not foreign
     known_lineage_sets=[("OPC", "Oligo")],  # optional: allow OPC -> oligodendrocyte transitions
-    library_key="library_id",               # optional: sequencing library / 10x channel
+    library_key="library_id",               # sequencing library / 10x channel (depth factor, ambient test)
+    score="nuclei",                         # flag on the foreign amount (default: "UMI_frac", the share)
+    threshold=0.25,                         # a quarter of a nucleus (the default for "nuclei")
     summary_by="subtype",                   # optional: summarize at a finer level
-    threshold=0.3,
 )
 
 adata = adata[adata.obs["mixing_flag"] == 0]  # remove flagged cells
@@ -201,14 +216,17 @@ adata = adata[adata.obs["mixing_flag"] == 0]  # remove flagged cells
 
 | Output | Contents |
 | --- | --- |
-| `adata.obs["mixing_UMI_frac"]` | Foreign score: fraction of marker-panel UMIs from other lineages |
+| `adata.obs["mixing_UMI_frac"]` | Share score: fraction of marker-panel UMIs from other lineages |
 | `adata.obs["mixing_RNA_frac"]` | The same, as an estimated fraction of total RNA |
+| `adata.obs["mixing_nuclei"]` | Amount score: largest amount of RNA from any single other lineage, in nucleus equivalents |
+| `adata.obs["mixing_nuclei_lineage"]` | That lineage |
 | `adata.obs["mixing_top"]` | Foreign cell type with the largest weight |
 | `adata.obs["mixing_top_weight"]` | That cell type's weight |
-| `adata.obs["mixing_flag"]` | 1 if `mixing_UMI_frac >= threshold`, else 0 |
+| `adata.obs["mixing_flag"]` | 1 if the `score` is `>= threshold`, else 0 |
 | `adata.obs["mixing_source"]` | For flagged cells: `"doublet"` or `"ambient"` (only with `library_key`) |
 | `adata.obsm["mixing_weights"]` | Per-cell weights over all groups |
-| `adata.uns["mixing"]` | Parameters, panel genes, reference profiles, and summaries |
+| `adata.obsm["mixing_lineage_nuclei"]` | Per-cell nucleus equivalents of every lineage, the cell's own included |
+| `adata.uns["mixing"]` | Parameters, panel genes, reference profiles, typical panel UMIs per group, and summaries; with `library_key`, the per-library summary holds the depth factors |
 | Return value | Per-group flagged fraction and most common foreign type, grouped by `summary_by` |
 
 ### Choosing the parameters
@@ -227,9 +245,19 @@ precursors, so they are not flagged. Mixtures across the merged lineages are
 then no longer detected. Labels may be lineage or group labels; unknown labels
 raise an error.
 
+**`score`.** `"UMI_frac"` (the default) flags on the share of foreign RNA,
+`"nuclei"` on its amount. Prefer `"nuclei"` with `library_key`. To convert
+panel UMIs to nuclei, each group's typical cells (the purest half by default,
+`core_quantile=0.5`) are modelled as group size times library depth, and both
+are fitted jointly by alternating medians. Fitting them jointly matters: if
+glia-rich libraries are also the deeper ones, a pooled median would make glia
+look larger than they are and undercount attached glial RNA.
+
 **`library_key`.** The sequencing library, such as the 10x channel, of each
-cell. It does not change the score or the flag. It adds `mixing_source`, which
-says where a flagged cell's foreign signal most likely comes from:
+cell. It sets the depth factor of `mixing_nuclei`, which can differ several-fold
+between libraries; without it, all cells share one depth. It does not change
+`mixing_UMI_frac`. It also adds `mixing_source`, which says where a flagged
+cell's foreign signal most likely comes from:
 
 - `"doublet"`: one specific foreign cell type explains the signal best, as for
   a heterotypic doublet or material attached from one other cell.
@@ -241,9 +269,15 @@ the single best foreign profile, and once as its own lineage plus the library's
 pooled profile. Pass the library rather than a coarser processing batch,
 because ambient RNA is shared within a library.
 
-**`threshold`.** The score distribution is usually bimodal, with clean cells
-near 0 and mixtures well above. Check a histogram of `mixing_UMI_frac` per
-group before relying on the default of 0.3.
+**`threshold`.** The default is 0.3 for `"UMI_frac"` and 0.25 for `"nuclei"`.
+Both distributions are usually bimodal, with clean cells near 0 and mixtures
+well above. Check a histogram of the score per group before relying on the
+default.
+
+For `"nuclei"`, a quarter of a nucleus is far above ambient RNA, which gives a
+few hundredths. In human cortex snRNA-seq, nuclei with attached material from
+another cell typically carry 0.3-0.6 of a nucleus, and heterotypic doublets
+about 1.
 
 ### Notes
 
