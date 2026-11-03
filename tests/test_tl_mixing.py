@@ -66,6 +66,62 @@ def _make_adata(n_pure=150, n_doublet=25, n_ambient=25, n_opc_oligo=25, seed=0):
     return ad.AnnData(counts, obs=obs, var=var)
 
 
+def _make_amount_adata(n_pure=150, n_mixed=25, seed=0):
+    """Pure cells at 2000 UMIs plus two mixtures where the foreign share and amount disagree."""
+    rng = np.random.default_rng(seed)
+    profiles, n_genes = _profiles(rng)
+    rows, labels, kinds = [], [], []
+    for group in GROUPS:
+        for _ in range(n_pure):
+            rows.append(rng.multinomial(2000, profiles[group]))
+            labels.append(group)
+            kinds.append("pure")
+    for _ in range(n_mixed):
+        # a large EN nucleus carrying half an astrocyte nucleus: small share, large amount
+        rows.append(rng.multinomial(6000, profiles["EN"]) + rng.multinomial(1000, profiles["Astro"]))
+        labels.append("EN")
+        kinds.append("large_host")
+        # a small astrocyte nucleus with a little EN RNA: large share, small amount
+        rows.append(rng.multinomial(300, profiles["Astro"]) + rng.multinomial(200, profiles["EN"]))
+        labels.append("Astro")
+        kinds.append("small_host")
+    return _as_adata(rows, labels, kinds, ["lib1"] * len(labels), n_genes)
+
+
+def _make_two_depth_adata(n_pure=80, n_mixed=20, seed=0):
+    """Two libraries sequenced at 2000 and 1000 UMIs per pure cell; mixed cells are EN plus 0.4 of an Oligo nucleus."""
+    rng = np.random.default_rng(seed)
+    profiles, n_genes = _profiles(rng)
+    rows, labels, kinds, libraries = [], [], [], []
+    for library, depth in (("deep", 2000), ("shallow", 1000)):
+        for group in GROUPS:
+            for _ in range(n_pure):
+                rows.append(rng.multinomial(depth, profiles[group]))
+                labels.append(group)
+                kinds.append("pure")
+                libraries.append(library)
+        for _ in range(n_mixed):
+            rows.append(rng.multinomial(depth, profiles["EN"]) + rng.multinomial(int(0.4 * depth), profiles["Oligo"]))
+            labels.append("EN")
+            kinds.append("partial")
+            libraries.append(library)
+    return _as_adata(rows, labels, kinds, libraries, n_genes)
+
+
+def _as_adata(rows, labels, kinds, libraries, n_genes):
+    obs = pd.DataFrame(
+        {
+            "subclass": pd.Categorical(labels),
+            "class": pd.Categorical([LINEAGE[x] for x in labels]),
+            "kind": kinds,
+            "channel": libraries,
+        },
+        index=[f"cell{i}" for i in range(len(labels))],
+    )
+    var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
+    return ad.AnnData(sparse.csr_matrix(np.vstack(rows).astype(np.float32)), obs=obs, var=var)
+
+
 class DetectLineageMixingTests(unittest.TestCase):
     def test_doublets_are_flagged_with_top_foreign_group(self):
         adata = _make_adata()
@@ -81,9 +137,10 @@ class DetectLineageMixingTests(unittest.TestCase):
         foreign_types = adata.obs.loc[kind == "doublet", "mixing_top"]
         self.assertGreaterEqual((foreign_types == "EN").mean(), 0.9)
         self.assertEqual(adata.obsm["mixing_weights"].shape, (adata.n_obs, len(GROUPS)))
+        self.assertEqual(adata.uns["mixing"]["threshold"], 0.3)
         self.assertIn("group_summary", adata.uns["mixing"])
         self.assertListEqual(
-            list(summary.columns), ["group", "n_cells", "median_UMI_frac", "n_flagged", "flag_fraction", "top"]
+            list(summary.columns), ["group", "n_cells", "median_UMI_frac", "median_nuclei", "n_flagged", "flag_fraction", "top"]
         )
         self.assertEqual(summary.set_index("group").loc["Astro", "top"], "EN")
 
@@ -151,6 +208,63 @@ class DetectLineageMixingTests(unittest.TestCase):
             sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False)
 
 
+    def test_nuclei_score_measures_amount_not_share(self):
+        adata = _make_amount_adata()
+        params = dict(groupby="subclass", lineage_key="class", use_raw=False, n_markers=20, library_key="channel")
+        kind = adata.obs["kind"]
+
+        sct.tl.detect_lineage_mixing(adata, **params)
+        flag = adata.obs["mixing_flag"].astype(bool)
+        self.assertGreaterEqual(flag[kind == "small_host"].mean(), 0.9)
+        self.assertLessEqual(flag[kind == "large_host"].mean(), 0.1)
+
+        sct.tl.detect_lineage_mixing(adata, score="nuclei", **params)
+        obs = adata.obs
+        flag = obs["mixing_flag"].astype(bool)
+        self.assertGreaterEqual(flag[kind == "large_host"].mean(), 0.9)
+        self.assertLessEqual(flag[kind == "small_host"].mean(), 0.1)
+        self.assertLessEqual(flag[kind == "pure"].mean(), 0.02)
+        self.assertAlmostEqual(obs.loc[kind == "large_host", "mixing_nuclei"].median(), 0.5, delta=0.1)
+        self.assertGreaterEqual((obs.loc[kind == "large_host", "mixing_nuclei_lineage"] == "Astro").mean(), 0.9)
+
+        uns = adata.uns["mixing"]
+        self.assertEqual(uns["score"], "nuclei")
+        self.assertEqual(uns["threshold"], 0.25)
+        lineages = list(uns["lineages"])
+        amounts = adata.obsm["mixing_lineage_nuclei"]
+        self.assertEqual(amounts.shape, (adata.n_obs, len(lineages)))
+        pure_en = (kind == "pure").to_numpy() & (obs["subclass"] == "EN").to_numpy()
+        self.assertAlmostEqual(float(np.median(amounts[pure_en, lineages.index("Neuron")])), 1.0, delta=0.05)
+
+    def test_nuclei_score_adjusts_for_library_depth(self):
+        adata = _make_two_depth_adata()
+        params = dict(lineage_key="class", use_raw=False, n_markers=20, score="nuclei")
+        partial = adata.obs["kind"] == "partial"
+        deep = partial & (adata.obs["channel"] == "deep")
+        shallow = partial & (adata.obs["channel"] == "shallow")
+
+        sct.tl.detect_lineage_mixing(adata, **params)
+        unadjusted = adata.obs["mixing_nuclei"]
+        self.assertAlmostEqual(unadjusted[deep].median() / unadjusted[shallow].median(), 2.0, delta=0.3)
+
+        sct.tl.detect_lineage_mixing(adata, library_key="channel", **params)
+        adjusted = adata.obs["mixing_nuclei"]
+        self.assertAlmostEqual(adjusted[deep].median(), 0.4, delta=0.08)
+        self.assertAlmostEqual(adjusted[shallow].median(), 0.4, delta=0.08)
+        self.assertGreaterEqual(adata.obs.loc[partial, "mixing_flag"].mean(), 0.9)
+        depth = adata.uns["mixing"]["library_summary"].set_index("library")["depth_factor"]
+        self.assertAlmostEqual(depth["deep"] / depth["shallow"], 2.0, delta=0.2)
+
+    def test_score_and_threshold_are_validated(self):
+        adata = _make_adata(n_pure=30, n_doublet=0, n_ambient=0, n_opc_oligo=0)
+
+        with self.assertRaises(ValueError):
+            sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False, score="share")
+        with self.assertRaises(ValueError):
+            sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False, score="nuclei", threshold=0)
+        with self.assertRaises(ValueError):
+            sct.tl.detect_lineage_mixing(adata, lineage_key="class", use_raw=False, threshold=1.5)
+
     def test_known_lineage_sets_rejects_unknown_labels(self):
         adata = _make_adata(n_pure=30, n_doublet=0, n_ambient=0, n_opc_oligo=0)
 
@@ -170,6 +284,9 @@ class DetectLineageMixingTests(unittest.TestCase):
             back = ad.read_h5ad(path)
         self.assertIn("mixing_source", back.obs)
         self.assertIn("library_summary", back.uns["mixing"])
+        self.assertIn("mixing_nuclei_lineage", back.obs)
+        self.assertIn("depth_factor", back.uns["mixing"]["library_summary"])
+        self.assertEqual(back.obsm["mixing_lineage_nuclei"].shape, (back.n_obs, len(back.uns["mixing"]["lineages"])))
 
     def test_backed_h5ad_matches_in_memory(self):
         for raw_format in ("csr", "csc"):
@@ -207,6 +324,11 @@ class DetectLineageMixingTests(unittest.TestCase):
                     backed.obs.loc[keep, "mixing_UMI_frac"], subset.obs["mixing_UMI_frac"], atol=1e-6
                 )
                 self.assertTrue(backed.obs.loc[~keep, "mixing_UMI_frac"].isna().all())
+                np.testing.assert_allclose(
+                    backed.obs.loc[keep, "mixing_nuclei"], subset.obs["mixing_nuclei"], atol=1e-5
+                )
+                self.assertTrue(backed.obs.loc[~keep, "mixing_nuclei"].isna().all())
+                self.assertEqual(backed.obsm["mixing_lineage_nuclei"].shape[0], backed.n_obs)
                 self.assertEqual(int(backed.obs.loc[~keep, "mixing_flag"].sum()), 0)
                 self.assertGreater(int(backed.obs["mixing_flag"].sum()), 0)
                 self.assertEqual(backed.obsm["mixing_weights"].shape[0], backed.n_obs)
