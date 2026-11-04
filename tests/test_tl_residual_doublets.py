@@ -66,11 +66,12 @@ def _make_adata(n_pure=200, n_hetero=60, n_homo=20, seed=0):
         },
         index=[f"cell{i}" for i in range(len(labels))],
     )
-    var = pd.DataFrame(index=[f"gene{i}" for i in range(n_genes)])
+    var = pd.DataFrame({"robust_protein_coding_autosome": True}, index=[f"gene{i}" for i in range(n_genes)])
     return ad.AnnData(sparse.csr_matrix(np.vstack(rows).astype(np.float32)), obs=obs, var=var)
 
 
-# groupby and library_key are left at their defaults ("subclass" and "libraryID")
+# groupby, library_key and gene_mask are left at their defaults:
+# "subclass", "libraryID" and "robust_protein_coding_autosome"
 PARAMS = dict(
     use_raw=False,
     n_top_genes=150,
@@ -168,13 +169,31 @@ class DetectResidualDoubletsTests(unittest.TestCase):
         score = adata.obs["residual_doublet_score"]
         np.testing.assert_array_equal(adata.obs["residual_doublet_flag"], (score >= 0.5).astype(int))
 
-    def test_library_key_defaults_to_libraryID(self):
+    def test_defaults_are_pipeline_columns(self):
         adata = _make_adata(n_pure=40, n_hetero=5, n_homo=0)
         del adata.obs["libraryID"]
         with self.assertRaisesRegex(KeyError, "libraryID"):
             sct.tl.detect_residual_doublets(adata, backend="cpu", **PARAMS)
-        sct.tl.detect_residual_doublets(adata, backend="cpu", library_key=None, **PARAMS)
+        del adata.var["robust_protein_coding_autosome"]
+        with self.assertRaisesRegex(KeyError, "robust_protein_coding_autosome"):
+            sct.tl.detect_residual_doublets(adata, backend="cpu", library_key=None, **PARAMS)
+        sct.tl.detect_residual_doublets(adata, backend="cpu", library_key=None, gene_mask=None, **PARAMS)
         self.assertTrue(adata.obs["residual_doublet_score"].notna().all())
+
+    def test_gene_mask_column_is_read_from_var_when_counts_are_in_raw(self):
+        adata = _make_adata(n_pure=60, n_hetero=10, n_homo=0)
+        keep = np.ones(adata.n_vars, dtype=bool)
+        keep[::7] = False
+        adata.raw = ad.AnnData(adata.X.copy(), var=pd.DataFrame(index=adata.var_names))  # raw.var without columns
+        adata.var["robust_protein_coding_autosome"] = keep
+        params = {**PARAMS, "use_raw": True}
+        by_name = adata.copy()
+        sct.tl.detect_residual_doublets(by_name, backend="cpu", gene_mask="robust_protein_coding_autosome", **params)
+        sct.tl.detect_residual_doublets(adata, backend="cpu", gene_mask=keep, **params)
+        np.testing.assert_array_equal(by_name.obs["residual_doublet_score"], adata.obs["residual_doublet_score"])
+        self.assertTrue(np.isin(by_name.uns["residual_doublet"]["genes"], adata.var_names[keep]).all())
+        with self.assertRaises(KeyError):
+            sct.tl.detect_residual_doublets(adata, backend="cpu", gene_mask="missing", **params)
 
     def test_parameters_are_validated(self):
         adata = _make_adata(n_pure=40, n_hetero=5, n_homo=0)

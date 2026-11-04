@@ -304,10 +304,12 @@ applies the same idea once to the whole dataset.
 **How it works.**
 
 1. Embedding: highly variable genes (Scanpy's `flavor="cell_ranger"` on
-   log1p(count / total × `target_sum`)) chosen on up to `hvg_cells_per_group`
-   cells per `groupby` group. They are standardized, clipped at 10, and reduced
-   to `n_pcs` principal components fitted on up to `pca_cells_per_group` cells
-   per group. Balancing by group keeps rare types resolved.
+   log1p(count / total × `target_sum`)) among the `gene_mask` genes, by default
+   the robust protein-coding autosomal genes. They are chosen on up to
+   `hvg_cells_per_group` cells per `groupby` group, standardized, clipped at
+   10, and reduced to `n_pcs` principal components fitted on up to
+   `pca_cells_per_group` cells per group. Balancing by group keeps rare types
+   resolved.
 2. Neighbour pool: `n_real` random real cells plus `n_simulated` simulated
    doublets. Each simulated doublet is the summed counts of two cells from the
    same library (`library_key`). Libraries are drawn in proportion to the
@@ -338,6 +340,7 @@ summary = sct.tl.detect_residual_doublets(
     adata,
     groupby="subclass",        # default: balances the embedding across cell types
     library_key="libraryID",   # default: simulated doublets pair cells of the same library
+    gene_mask="robust_protein_coding_autosome",  # default: adata.var column of genes to use
     flag_rate=0.01,            # default: flag the 1% of cells with the highest scores
     backend="auto",            # "cpu" (exact, NumPy), "gpu" (exact, PyTorch + CUDA), or "auto"
 )
@@ -359,6 +362,17 @@ adata = adata[adata.obs["residual_doublet_flag"] == 0]  # remove flagged cells
 channel) of each cell; the defaults are `"subclass"` and `"libraryID"`. Pass
 `library_key=None` to let any two cells pair, and `groupby=None` to sample the
 embedding cells at random.
+
+**`gene_mask`.** The genes the embedding may use. The default is the pipeline's
+`robust_protein_coding_autosome` column. It is read from the count matrix's
+`var`, or from `adata.var` (matched by gene name) when the counts are in `raw`
+and `raw.var` has no columns. A boolean array or a list of gene names also
+works. `gene_mask=None` uses all genes except `MT-`, `RPL` and `RPS` genes. That
+lets lncRNAs and sex-chromosome genes such as `XIST` into the embedding. In the
+internal benchmark, with the same random seed, this replaced about a third of
+the highly variable genes, mostly with lncRNAs. It changed which cells were
+flagged more than a different random seed did (overlap 32% against 55%), and
+removed slightly fewer synthetic doublets.
 
 **`flag_rate` or `threshold`.** `flag_rate=0.01` flags the 1% of cells with the
 highest scores. Cells tied at the cut are flagged too, so slightly more may be

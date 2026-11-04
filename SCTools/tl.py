@@ -1747,7 +1747,7 @@ def detect_lineage_mixing(
 
 
 # ---------------------------------------------------------------------------------------------
-# kNN doublet score
+# Residual doublet detection
 # ---------------------------------------------------------------------------------------------
 
 
@@ -1894,7 +1894,7 @@ def detect_residual_doublets(
     fit_cells=None,
     layer: str = None,
     use_raw: bool = None,
-    gene_mask=None,
+    gene_mask="robust_protein_coding_autosome",
     n_top_genes: int = 3000,
     n_pcs: int = 30,
     n_neighbors: int = 50,
@@ -1918,11 +1918,11 @@ def detect_residual_doublets(
     :func:`detect_lineage_mixing` and :func:`detect_outliers`), on the cells you intend to keep.
     It applies the Scrublet idea once to the whole dataset instead of library by library:
 
-    1. Embedding: ``n_top_genes`` highly variable genes (Scanpy ``flavor="cell_ranger"`` on
-       log1p(count / total * ``target_sum``)) chosen on up to ``hvg_cells_per_group`` cells per
-       ``groupby`` group, standardized (clipped at 10) and reduced to ``n_pcs`` principal
-       components fitted on up to ``pca_cells_per_group`` cells per group. Balancing by group keeps
-       rare types resolved.
+    1. Embedding: ``n_top_genes`` highly variable genes among the ``gene_mask`` genes (Scanpy
+       ``flavor="cell_ranger"`` on log1p(count / total * ``target_sum``)), chosen on up to
+       ``hvg_cells_per_group`` cells per ``groupby`` group, standardized (clipped at 10) and
+       reduced to ``n_pcs`` principal components fitted on up to ``pca_cells_per_group`` cells per
+       group. Balancing by group keeps rare types resolved.
     2. Neighbour pool: ``n_real`` random real cells plus ``n_simulated`` simulated doublets. Each
        simulated doublet is the summed counts of two random cells of the same library
        (``library_key``). Libraries are drawn with probability proportional to the square of their
@@ -1957,9 +1957,12 @@ def detect_residual_doublets(
     layer, use_raw
         Where the counts are, as in :func:`detect_lineage_mixing`.
     gene_mask
-        Genes allowed in the embedding: a boolean array over the count matrix's genes, a boolean
-        column of its ``var``, or a list of gene names. Defaults to all genes except mitochondrial
-        (``MT-``) and ribosomal protein (``RPL``/``RPS``) genes.
+        Genes allowed in the embedding: the name of a boolean column of the count matrix's ``var``
+        or of ``adata.var`` (matched by gene name when the counts are in ``raw``), a boolean array
+        over the count matrix's genes, or a list of gene names. The default is the pipeline's robust
+        protein-coding autosomal genes. Pass None to use all genes except mitochondrial (``MT-``) and
+        ribosomal protein (``RPL``/``RPS``) genes; this lets lncRNAs and sex-chromosome genes such as
+        ``XIST`` into the embedding.
     n_top_genes, n_pcs
         Embedding size.
     n_neighbors
@@ -2034,10 +2037,22 @@ def detect_residual_doublets(
         allowed = ~np.asarray(gene_names.str.match(r"^(MT-|mt-|RP[LS]\d|Rp[ls]\d)"), dtype=bool)
     elif isinstance(gene_mask, str):
         raw_used = layer is None and (use_raw if use_raw is not None else adata.raw is not None)
-        var = adata.raw.var if raw_used else adata.var
-        if gene_mask not in var.columns:
-            raise KeyError(f"`gene_mask`={gene_mask!r} is not a column of the count matrix's var.")
-        allowed = var[gene_mask].to_numpy(dtype=bool)
+        count_var = adata.raw.var if raw_used else adata.var
+        if gene_mask in count_var.columns:
+            allowed = count_var[gene_mask].to_numpy(dtype=bool)
+        elif raw_used and gene_mask in adata.var.columns:
+            # raw.var often has no columns; take adata.var's, matched to the count matrix by gene name
+            column = adata.var[gene_mask].to_numpy(dtype=bool)
+            var_names = pd.Index(adata.var_names).astype(str)
+            if var_names.equals(gene_names):
+                allowed = column
+            else:
+                allowed = pd.Series(column, index=var_names).reindex(gene_names, fill_value=False).to_numpy(dtype=bool)
+        else:
+            raise KeyError(
+                f"`gene_mask`={gene_mask!r} is not a column of adata.var or of the count matrix's var; pass a "
+                "boolean column, a gene list, or gene_mask=None for all genes except MT-/RPL/RPS."
+            )
     else:
         allowed = np.asarray(gene_mask)
         if allowed.dtype != bool:
@@ -2174,7 +2189,7 @@ def detect_residual_doublets(
         sim[first : first + chunk_size] = _project_rows(_log_normalize_rows(D, totals[a] + totals[b], None, target_sum), model)
     del H
 
-    # ---- kNN score: fraction of simulated doublets among the neighbours, self excluded ----
+    # ---- score: fraction of simulated doublets among each cell's nearest neighbours, self excluded ----
     R = np.vstack([pcs[real_cells], sim])
     is_sim = np.r_[np.zeros(real_cells.size, dtype=bool), np.ones(sim.shape[0], dtype=bool)]
     self_index = np.full(n_obs, -1, dtype=np.int64)
