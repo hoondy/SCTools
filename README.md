@@ -70,6 +70,7 @@ See [Working with large H5AD files](#working-with-large-h5ad-files) for examples
 | --- | --- |
 | `detect_outliers` | Flag cells that sit apart from their annotation group in an embedding ([details](#outlier-detection)) |
 | `detect_lineage_mixing` | Flag heterotypic doublets and cross-lineage contamination ([details](#lineage-mixing-detection-heterotypic-doublets-and-contamination)) |
+| `detect_knn_doublets` | Flag doublets left after cleaning, against simulated doublets pooled over all libraries; CPU or GPU ([details](#knn-doublet-detection-after-cleaning)) |
 | `pls`, `pls_score` | Supervised embedding and per-cell disease score with partial least squares ([details](#pls-supervised-disease-axis)) |
 | `agg_by_cluster` | Mean scaled log-CPM expression per cluster, from an H5AD file's `raw.X` |
 | `pb_agg_by_cluster` | Pseudobulk expression per cluster, using Pegasus |
@@ -288,6 +289,114 @@ about 1.
 - Review `summary` at a finer level such as subtype. A subcluster with a
   consistent foreign type and a high flagged fraction is often better removed
   as a whole than cell by cell.
+
+## kNN doublet detection (after cleaning)
+
+`sct.tl.detect_knn_doublets` scores each cell by how many of its nearest
+neighbours are simulated doublets, using one reference pooled over all
+libraries. Run it after the per-library doublet step (Scrublet) and cleaning
+(`detect_lineage_mixing`, `detect_outliers`), on the cells you intend to keep.
+The doublets left at that point are mostly mixtures within a lineage, such as
+two excitatory neuron subclasses, and small amounts of another lineage. A
+per-library Scrublet run ranks these poorly, because each library has only a
+few thousand cells and its cutoff targets doublets across broad clusters.
+
+**How it works.**
+
+1. Embedding: highly variable genes (Scanpy's `flavor="cell_ranger"` on
+   log1p(count / total × `target_sum`)) chosen on up to `hvg_cells_per_group`
+   reference cells per `groupby` group. They are standardized, clipped at 10,
+   and reduced to `n_pcs` principal components fitted on up to
+   `pca_cells_per_group` reference cells per group. Balancing by group keeps
+   rare types resolved.
+2. Reference: `n_reference` random reference cells as singlets, plus
+   `n_simulated` doublets. Each doublet is the summed counts of two reference
+   cells from the same library (`library_key`). Libraries are drawn in
+   proportion to the square of their size, because doublets scale with loading.
+3. Score: the fraction of simulated doublets among each cell's `n_neighbors`
+   nearest neighbours. A cell is never its own neighbour.
+4. Flag: cells scoring at or above the `quantile` (default 0.99) of the
+   reference cells' own scores, or at or above an explicit `threshold`.
+
+Both the singlets and the simulated doublets come from the data, so no external
+annotation is needed. The function needs only the base install. PyTorch is
+optional and is used for the GPU backend.
+
+```python
+import anndata as ad
+import SCTools as sct
+
+adata = ad.read_h5ad("cleaned.h5ad", backed="r")   # counts are streamed from raw.X
+
+summary = sct.tl.detect_knn_doublets(
+    adata,
+    groupby="subclass",             # balances the embedding across cell types
+    library_key="library_id",       # simulated doublets pair cells of the same 10x channel
+    gene_mask="robust_protein_coding_autosome",  # optional: boolean column of the count matrix's var
+    target_sum=4679,                # the dataset's depth normalization (default 1e4)
+    quantile=0.99,                  # flag the top 1% of the reference cells' scores
+    backend="auto",                 # "cpu" (exact, NumPy), "gpu" (exact, PyTorch + CUDA), or "auto"
+)
+
+adata = adata[adata.obs["knn_doublet_flag"] == 0]  # remove flagged cells
+```
+
+| Output | Contents |
+| --- | --- |
+| `adata.obs["knn_doublet_score"]` | Fraction of simulated doublets among the cell's neighbours (steps of `1 / n_neighbors`) |
+| `adata.obs["knn_doublet_flag"]` | 1 if the score is `>= threshold`, else 0 |
+| `adata.obsm["knn_doublet_pca"]` | The embedding (only with `store_pca=True`) |
+| `adata.uns["knn_doublet"]` | Parameters, threshold, genes, the fitted embedding (`mean`, `std`, `zmean`, `loadings`), and the per-group summary |
+| Return value | Per-group cell counts, median score, and flagged fraction |
+
+### Choosing the parameters
+
+**`reference`.** This sets the cells used as singlets, as doublet parents, and
+for the embedding and the threshold. Every cell is scored either way. The
+default is all cells, which suits an already-cleaned object. Pass a boolean
+`.obs` column to restrict it.
+
+**`groupby` and `library_key`.** Pass cell-type labels and the 10x channel.
+Without `library_key`, any two reference cells can pair.
+
+**`quantile` or `threshold`.** The score of a cell surrounded by singlets is
+near 0. That of a heterotypic doublet is near 1. Same-type ("homotypic")
+simulated doublets sit on top of real clusters, so typical cells score a
+little above 0. `quantile=0.99` removes about 1% of the cells. Lower it, for
+example to `0.95`, to trade cells for more doublets removed.
+
+**`n_reference` and `n_simulated`.** Keep them equal, so that a score of 0.5
+means an even neighbourhood. Their defaults of 200,000 each suit up to about a
+million cells.
+
+**`backend`.** Both backends run an exact search, so they return the same
+neighbours up to floating-point ties. `"cpu"` uses multithreaded NumPy; it
+limits BLAS to one thread per worker when `threadpoolctl` is installed. `"gpu"`
+needs PyTorch with a CUDA device. `"auto"` uses the GPU when one is available.
+
+### Notes
+
+- Requires raw counts, from the same places as `detect_lineage_mixing`.
+  Log-normalized input raises an error. Works on backed AnnData and on views of
+  it; the results are written into the parent object.
+- **Performance.** Measured on the GEN_A18 frontal cortex data: 674,129 nuclei
+  in 194 libraries, read backed from a gzip-compressed H5AD, on 16 cores and an
+  RTX 3090.
+  - The GPU backend took 2.9 minutes and the CPU backend 7.2 minutes.
+  - Peak memory was 6–7 GB with the default reference sizes.
+  - The two backends gave identical scores for 99.996% of the cells.
+- **Seed dependence.** Which cells sit exactly at the cutoff depends on the
+  random sample of singlets and doublet parents. With a different
+  `random_state`, about 55% of the top-1% set is flagged again. The number of
+  doublets removed stays within about 1 percentage point. A fixed
+  `random_state` gives identical results.
+- **Evidence (GEN_A18).** This was measured after Scrublet, lineage mixing
+  (`score="nuclei"`) and LOF, against a second Scrublet pass per library at the
+  same number of cells removed.
+  - The kNN score removed 1.3–1.9× more of the remaining same-lineage
+    synthetic doublets.
+  - It typically removed 2–3× more of the remaining partial cross-lineage ones.
+  - It kept cell-type profiles as close to the curated annotation as before.
 
 ## PLS: supervised disease axis
 
