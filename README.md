@@ -368,11 +368,23 @@ embedding cells at random.
 `var`, or from `adata.var` (matched by gene name) when the counts are in `raw`
 and `raw.var` has no columns. A boolean array or a list of gene names also
 works. `gene_mask=None` uses all genes except `MT-`, `RPL` and `RPS` genes. That
-lets lncRNAs and sex-chromosome genes such as `XIST` into the embedding. In the
-internal benchmark, with the same random seed, this replaced about a third of
-the highly variable genes, mostly with lncRNAs. It changed which cells were
-flagged more than a different random seed did (overlap 32% against 55%), and
-removed slightly fewer synthetic doublets.
+lets lncRNAs and sex-chromosome genes such as `XIST` into the embedding.
+
+In the internal benchmark, `gene_mask=None` was compared with the default at
+the same random seed:
+
+- It replaced about a third of the highly variable genes, mostly with lncRNAs.
+- It changed which cells were flagged more than a different random seed did
+  (overlap 32% against 55%).
+- It ranked synthetic doublets lower among the real cells. Each synthetic
+  doublet combined two nuclei from one library, and only those that survived
+  the earlier cleaning steps were counted. The AUC was lower for every doublet
+  type, by 0.015–0.07, against at most 0.013 between random seeds.
+- At the 1% cut it flagged 5% more real cells, yet removed fewer doublets:
+  - 684 of 1,504 same-lineage doublets, against 705 (not significant);
+  - 54 of 1,313 cross-lineage doublets carrying 20% of a partner's counts,
+    against 74 (paired p = 0.015);
+  - the other doublet types differed by at most two doublets.
 
 **`flag_rate` or `threshold`.** `flag_rate=0.01` flags the 1% of cells with the
 highest scores. Cells tied at the cut are flagged too, so slightly more may be
