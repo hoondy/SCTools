@@ -70,6 +70,7 @@ See [Working with large H5AD files](#working-with-large-h5ad-files) for examples
 | --- | --- |
 | `detect_outliers` | Flag cells that sit apart from their annotation group in an embedding ([details](#outlier-detection)) |
 | `detect_lineage_mixing` | Flag heterotypic doublets and cross-lineage contamination ([details](#lineage-mixing-detection-heterotypic-doublets-and-contamination)) |
+| `detect_residual_doublets` | Flag doublets left after cleaning, scored by how many of a cell's nearest neighbours are simulated doublets; CPU or GPU ([details](#residual-doublet-detection-after-cleaning)) |
 | `pls`, `pls_score` | Supervised embedding and per-cell disease score with partial least squares ([details](#pls-supervised-disease-axis)) |
 | `agg_by_cluster` | Mean scaled log-CPM expression per cluster, from an H5AD file's `raw.X` |
 | `pb_agg_by_cluster` | Pseudobulk expression per cluster, using Pegasus |
@@ -288,6 +289,149 @@ about 1.
 - Review `summary` at a finer level such as subtype. A subcluster with a
   consistent foreign type and a high flagged fraction is often better removed
   as a whole than cell by cell.
+
+## Residual doublet detection (after cleaning)
+
+`sct.tl.detect_residual_doublets` flags the doublets that remain after the
+per-library doublet step (Scrublet) and cleaning (`detect_lineage_mixing`,
+`detect_outliers`). Run it on the cells you intend to keep. The doublets left
+at that point are mostly mixtures within a lineage, such as two excitatory
+neuron subclasses, and small amounts of another lineage. A per-library
+Scrublet run ranks these poorly, because each library has only a few thousand
+cells and its cutoff targets doublets across broad clusters. This function
+applies the same idea once to the whole dataset.
+
+**How it works.**
+
+1. Embedding: highly variable genes (Scanpy's `flavor="cell_ranger"` on
+   log1p(count / total × `target_sum`)) among the `gene_mask` genes, by default
+   the robust protein-coding autosomal genes. They are chosen on up to
+   `hvg_cells_per_group` cells per `groupby` group, standardized, clipped at
+   10, and reduced to `n_pcs` principal components fitted on up to
+   `pca_cells_per_group` cells per group. Balancing by group keeps rare types
+   resolved.
+2. Neighbour pool: `n_real` random real cells plus `n_simulated` simulated
+   doublets. Each simulated doublet is the summed counts of two cells from the
+   same library (`library_key`). Libraries are drawn in proportion to the
+   square of their size, because doublets scale with loading.
+3. Score: the fraction of simulated doublets among each cell's `n_neighbors`
+   nearest neighbours in the pool. A cell is never its own neighbour.
+4. Flag: the `flag_rate` fraction of cells with the highest scores (default
+   1%), or the cells at or above a fixed `threshold`.
+
+**What the score measures.** How close a cell sits to simulated doublets
+compared with real cells. It is not a distance from cluster centres. A score of
+0 means all of the cell's neighbours are real cells; 1 means all of them are
+simulated doublets. Simulated doublets of two cells of the same type land
+inside that type's cluster, so ordinary cells of large clusters score well
+above 0. That is why the default cut is a rate rather than a fixed score.
+
+Both the real cells and the simulated doublets come from the data, so no
+external annotation is needed. The function needs only the base install.
+PyTorch is optional and is used for the GPU backend.
+
+```python
+import anndata as ad
+import SCTools as sct
+
+adata = ad.read_h5ad("cleaned.h5ad", backed="r")   # counts are streamed from raw.X
+
+summary = sct.tl.detect_residual_doublets(
+    adata,
+    groupby="subclass",        # default: balances the embedding across cell types
+    library_key="libraryID",   # default: simulated doublets pair cells of the same library
+    gene_mask="robust_protein_coding_autosome",  # default: adata.var column of genes to use
+    flag_rate=0.01,            # default: flag the 1% of cells with the highest scores
+    backend="auto",            # "cpu" (exact, NumPy), "gpu" (exact, PyTorch + CUDA), or "auto"
+)
+
+adata = adata[adata.obs["residual_doublet_flag"] == 0]  # remove flagged cells
+```
+
+| Output | Contents |
+| --- | --- |
+| `adata.obs["residual_doublet_score"]` | Fraction of simulated doublets among the cell's neighbours (steps of `1 / n_neighbors`) |
+| `adata.obs["residual_doublet_flag"]` | 1 if flagged, else 0 |
+| `adata.obsm["residual_doublet_pca"]` | The embedding (only with `store_pca=True`) |
+| `adata.uns["residual_doublet"]` | Parameters, the score cut used (`threshold`), genes, the fitted embedding (`mean`, `std`, `zmean`, `loadings`), and the per-group summary |
+| Return value | Per-group cell counts, median score, and flagged fraction |
+
+### Choosing the parameters
+
+**`groupby` and `library_key`.** The cell-type labels and the library (10x
+channel) of each cell; the defaults are `"subclass"` and `"libraryID"`. Pass
+`library_key=None` to let any two cells pair, and `groupby=None` to sample the
+embedding cells at random.
+
+**`gene_mask`.** The genes the embedding may use. The default is the pipeline's
+`robust_protein_coding_autosome` column: robust protein-coding genes on the
+autosomes. It is read from the count matrix's `var`, or from `adata.var`
+(matched by gene name) when the counts are in `raw` and `raw.var` has no
+columns. A boolean array or a list of gene names also works. `gene_mask=None`
+uses all genes except `MT-`, `RPL` and `RPS` genes, which lets lncRNAs and
+sex-chromosome genes such as `XIST` into the embedding.
+
+The default works better than `gene_mask=None`. The internal benchmark ran both
+with the same random seed, on synthetic doublets that each combined two nuclei
+from one library and had survived the earlier cleaning steps:
+
+- The default ranked synthetic doublets higher among the real cells for every
+  doublet type. Its AUC was higher by 0.015–0.07, while random seeds changed
+  the AUC by at most 0.013.
+- At the 1% cut the default flagged fewer real cells (7,160 against 7,517), yet
+  removed more doublets:
+  - 74 of 1,313 cross-lineage doublets carrying 20% of a partner's counts,
+    against 54 with `gene_mask=None` (paired p = 0.015);
+  - 705 of 1,504 same-lineage doublets, against 684 (not significant);
+  - the other doublet types differed by at most two doublets.
+- The gene set changes the result more than the random seed does. The flagged
+  cells of the two gene sets overlapped by 32%, against 55% between seeds.
+  `gene_mask=None` replaced about a third of the 3,000 highly variable genes,
+  mostly with lncRNAs.
+
+**`flag_rate` or `threshold`.** `flag_rate=0.01` flags the 1% of cells with the
+highest scores. Cells tied at the cut are flagged too, so slightly more may be
+flagged (1.09% in the internal benchmark below). Raise it, for example to
+`0.02`, to trade cells for more doublets removed. In the benchmark the median
+score was 0.12, the top 1% started at 0.86, and 11.6% of cells scored 0.5 or
+more, so a fixed cut at 0.5 would remove far too many cells. Pass `threshold`
+to use a fixed score instead.
+
+**`fit_cells`.** The cells that the embedding, the pool of real cells and the
+simulated doublets come from. Every cell is scored either way. The default is
+all cells, which suits an already-cleaned object. Pass a boolean `.obs` column
+to restrict it, for example to score extra cells against a trusted set.
+
+**`n_real` and `n_simulated`.** Keep them equal, so that a score of 0.5 means
+as many simulated doublets as real cells nearby. Their defaults of 200,000 each
+suit up to about a million cells.
+
+**`backend`.** Both backends run an exact search, so they return the same
+neighbours up to floating-point ties. `"cpu"` uses multithreaded NumPy; it
+limits BLAS to one thread per worker when `threadpoolctl` is installed. `"gpu"`
+needs PyTorch with a CUDA device. `"auto"` uses the GPU when one is available.
+
+### Notes
+
+- Requires raw counts, from the same places as `detect_lineage_mixing`.
+  Log-normalized input raises an error. Works on backed AnnData and on views of
+  it; the results are written into the parent object.
+- **Internal benchmark.** About 674,000 nuclei in 194 libraries, read backed
+  from a gzip-compressed H5AD, on 16 cores and an RTX 3090.
+  - The GPU backend took 2.9 minutes and the CPU backend 7.2 minutes.
+  - Peak memory was 6–7 GB with the default pool sizes.
+  - The two backends gave identical scores for 99.996% of the cells.
+  - It was run after Scrublet, lineage mixing (`score="nuclei"`) and LOF, and
+    compared with a second per-library Scrublet pass removing the same number
+    of cells. It removed 1.3–1.9× more of the remaining same-lineage synthetic
+    doublets, and typically 2–3× more of the remaining partial cross-lineage
+    ones. Cell-type profiles stayed as close to the curated annotation as
+    before.
+- **Seed dependence.** Which cells sit exactly at the cut depends on the random
+  sample of real cells and doublet parents. With a different `random_state`,
+  about 55% of the flagged set is flagged again. The number of doublets removed
+  stays within about 1 percentage point. A fixed `random_state` gives identical
+  results.
 
 ## PLS: supervised disease axis
 

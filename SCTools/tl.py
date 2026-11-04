@@ -1,5 +1,8 @@
 """Analysis and tool helpers for SCTools."""
 
+import os
+from contextlib import nullcontext
+
 from ._shared import (
     _get_sample_size,
     _require_group_kfold,
@@ -1743,6 +1746,507 @@ def detect_lineage_mixing(
     return summary
 
 
+# ---------------------------------------------------------------------------------------------
+# Residual doublet detection
+# ---------------------------------------------------------------------------------------------
+
+
+def _cell_ranger_hvg(sums, sumsq, n_cells, n_top, allowed):
+    """Highly variable genes as Scanpy's ``highly_variable_genes(flavor="cell_ranger")`` on log-normalized data.
+
+    ``sums`` and ``sumsq`` are per-gene sums of the log-normalized values and of their squares over
+    ``n_cells`` cells. As Scanpy, the dispersion is var / mean (variance with ddof=1) of those values;
+    genes are binned at the 10th, 15th, ..., 100th percentiles of the mean, each dispersion is centred
+    on its bin median and scaled by the bin's MAD, and every gene at or above the ``n_top``-th highest
+    normalized dispersion is kept. Only ``allowed`` genes detected in at least one cell are considered.
+    Returns sorted gene indices.
+    """
+    candidates = np.flatnonzero(allowed & (sums > 0))
+    if candidates.size == 0:
+        raise ValueError("No candidate genes for the embedding: check `gene_mask` and the count matrix.")
+    mean = sums[candidates] / n_cells
+    var = np.maximum(sumsq[candidates] - n_cells * mean**2, 0.0) / max(n_cells - 1, 1)
+    mean[mean == 0] = 1e-12
+    dispersion = var / mean
+    edges = np.r_[-np.inf, np.percentile(mean, np.arange(10, 105, 5)), np.inf]
+    bins = pd.cut(mean, np.unique(edges))
+    grouped = pd.Series(dispersion).groupby(bins, observed=True)
+
+    def mad(values):
+        values = np.asarray(values, dtype=float)
+        return np.median(np.abs(values - np.median(values))) / 0.6744897501960817
+
+    median = grouped.transform("median").to_numpy()
+    spread = grouped.transform(mad).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized = (dispersion - median) / spread
+    finite = normalized[~np.isnan(normalized)]
+    if n_top >= finite.size:
+        keep = ~np.isnan(normalized)
+    else:
+        cutoff = np.sort(finite)[::-1][n_top - 1]
+        keep = np.nan_to_num(normalized, nan=-np.inf) >= cutoff
+    return np.sort(candidates[keep])
+
+
+def _log_normalize_rows(X, totals, genes, target_sum):
+    """log1p(count / total * target_sum) for the ``genes`` columns of csr ``X`` (all if None), as float32 csr."""
+    Xg = sparse.csr_matrix(X if genes is None else X[:, genes], dtype=np.float64)
+    rows = np.repeat(np.arange(Xg.shape[0]), np.diff(Xg.indptr))
+    Xg.data = np.log1p(Xg.data / np.maximum(totals[rows], 1.0) * target_sum)
+    return Xg.astype(np.float32)
+
+
+def _project_rows(Xlog, model):
+    """Coordinates of log-normalized rows in the fitted embedding (standardize, clip, centre, rotate)."""
+    Z = Xlog.toarray() if sparse.issparse(Xlog) else np.asarray(Xlog, dtype=np.float32)
+    Z -= model["mean"]
+    Z /= model["std"]
+    np.clip(Z, -model["clip"], model["clip"], out=Z)
+    Z -= model["zmean"]
+    return Z @ model["loadings"]
+
+
+def _knn_numpy(queries, reference, k, n_jobs, query_block=256, reference_block=32768):
+    """Exact Euclidean k nearest neighbours on the CPU, sorted by distance (blocked, multithreaded NumPy)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    reference = np.ascontiguousarray(reference, dtype=np.float32)
+    ref_norm = np.einsum("ij,ij->i", reference, reference, dtype=np.float64).astype(np.float32)
+    k = min(k, reference.shape[0])
+
+    def search(start):
+        q = np.ascontiguousarray(queries[start : start + query_block], dtype=np.float32)
+        best_d = np.full((q.shape[0], k), np.inf, dtype=np.float32)
+        best_i = np.zeros((q.shape[0], k), dtype=np.int64)
+        for first in range(0, reference.shape[0], reference_block):
+            # ||q - r||^2 up to the per-query constant ||q||^2, which does not change the ranking
+            d = q @ reference[first : first + reference_block].T
+            d *= -2.0
+            d += ref_norm[None, first : first + reference_block]
+            kk = min(k, d.shape[1])
+            part = np.argpartition(d, kk - 1, axis=1)[:, :kk]
+            cand_d = np.concatenate([best_d, np.take_along_axis(d, part, axis=1)], axis=1)
+            cand_i = np.concatenate([best_i, part + first], axis=1)
+            keep = np.argpartition(cand_d, k - 1, axis=1)[:, :k]
+            best_d = np.take_along_axis(cand_d, keep, axis=1)
+            best_i = np.take_along_axis(cand_i, keep, axis=1)
+        order = np.argsort(best_d, axis=1, kind="stable")
+        return np.take_along_axis(best_i, order, axis=1)
+
+    try:  # one BLAS thread per worker; the workers already use every core
+        from threadpoolctl import threadpool_limits
+
+        limits = threadpool_limits(limits=1, user_api="blas")
+    except ImportError:
+        limits = nullcontext()
+    with limits, ThreadPoolExecutor(max_workers=n_jobs) as pool:
+        parts = list(pool.map(search, range(0, queries.shape[0], query_block)))
+    return np.vstack(parts) if parts else np.zeros((0, k), dtype=np.int64)
+
+
+def _knn_torch(queries, reference, k, device, memory_bytes=1 << 30):
+    """Exact Euclidean k nearest neighbours with PyTorch, sorted by distance."""
+    import torch
+
+    ref = torch.as_tensor(np.ascontiguousarray(reference, dtype=np.float32), device=device)
+    ref_norm = (ref * ref).sum(1)
+    k = min(k, ref.shape[0])
+    batch = max(64, int(memory_bytes // (4 * max(ref.shape[0], 1))))
+    out = []
+    with torch.no_grad():
+        for start in range(0, queries.shape[0], batch):
+            q = torch.as_tensor(np.ascontiguousarray(queries[start : start + batch], dtype=np.float32), device=device)
+            d = ref_norm[None, :] - 2.0 * (q @ ref.T)
+            out.append(torch.topk(d, k, dim=1, largest=False, sorted=True).indices.cpu().numpy())
+    return np.vstack(out) if out else np.zeros((0, k), dtype=np.int64)
+
+
+def _resolve_knn_backend(backend):
+    """Return ("cpu", None) or ("gpu", device) for ``backend`` in {"auto", "cpu", "gpu"}."""
+    if backend not in ("auto", "cpu", "gpu"):
+        raise ValueError("`backend` must be 'auto', 'cpu' or 'gpu'.")
+    if backend == "cpu":
+        return "cpu", None
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        torch, cuda = None, False
+    if backend == "gpu" and not cuda:
+        raise RuntimeError("backend='gpu' needs PyTorch with a CUDA device; use backend='cpu' or 'auto'.")
+    return ("gpu", "cuda") if cuda else ("cpu", None)
+
+
+def _drop_self(indices, self_index):
+    """Remove each query's own position in the pool from its k+1 sorted neighbours (else the farthest)."""
+    is_self = indices == self_index[:, None]
+    keep = ~is_self
+    keep[~is_self.any(1), -1] = False
+    return indices[keep].reshape(indices.shape[0], indices.shape[1] - 1)
+
+
+def detect_residual_doublets(
+    adata: ad.AnnData,
+    groupby: str = "subclass",
+    library_key: str = "libraryID",
+    fit_cells=None,
+    layer: str = None,
+    use_raw: bool = None,
+    gene_mask="robust_protein_coding_autosome",
+    n_top_genes: int = 3000,
+    n_pcs: int = 30,
+    n_neighbors: int = 50,
+    n_real: int = 200_000,
+    n_simulated: int = 200_000,
+    hvg_cells_per_group: int = 2000,
+    pca_cells_per_group: int = 5000,
+    target_sum: float = 1e4,
+    flag_rate: float = 0.01,
+    threshold: float = None,
+    backend: str = "auto",
+    n_jobs: int = None,
+    chunk_size: int = 20000,
+    store_pca: bool = False,
+    key_added: str = "residual_doublet",
+    random_state: int = 0,
+) -> pd.DataFrame:
+    """Flag doublets left after cleaning: cells whose nearest neighbours are mostly simulated doublets.
+
+    Run this after the per-library doublet step and cleaning (e.g. Scrublet, then
+    :func:`detect_lineage_mixing` and :func:`detect_outliers`), on the cells you intend to keep.
+    It applies the Scrublet idea once to the whole dataset instead of library by library:
+
+    1. Embedding: ``n_top_genes`` highly variable genes among the ``gene_mask`` genes (Scanpy
+       ``flavor="cell_ranger"`` on log1p(count / total * ``target_sum``)), chosen on up to
+       ``hvg_cells_per_group`` cells per ``groupby`` group, standardized (clipped at 10) and
+       reduced to ``n_pcs`` principal components fitted on up to ``pca_cells_per_group`` cells per
+       group. Balancing by group keeps rare types resolved.
+    2. Neighbour pool: ``n_real`` random real cells plus ``n_simulated`` simulated doublets. Each
+       simulated doublet is the summed counts of two random cells of the same library
+       (``library_key``). Libraries are drawn with probability proportional to the square of their
+       number of cells, as doublets scale with loading.
+    3. Score: the fraction of simulated doublets among each cell's ``n_neighbors`` nearest
+       neighbours in the pool (a cell is never its own neighbour). It measures how close a cell
+       sits to simulated doublets rather than to real cells: 0 when all its neighbours are real
+       cells, 1 when all are simulated doublets. It is not a distance to clusters.
+    4. Flag: the ``flag_rate`` fraction of cells with the highest scores (1% by default), or the
+       cells scoring at or above a fixed ``threshold``. The default is a rate rather than a fixed
+       score because simulated doublets of two cells of the same type land inside that type's
+       cluster, so ordinary cells of large clusters score well above 0.
+
+    Steps 1 and 2 use ``fit_cells`` (all cells by default); every cell in ``adata`` is scored. Both
+    the real cells and the simulated doublets come from the data, so no external annotation is
+    needed.
+
+    Parameters
+    ----------
+    adata
+        AnnData with raw counts; may be backed or a view of a backed AnnData.
+    groupby
+        ``.obs`` column of cell-type labels used to balance the embedding. Pass None to sample the
+        embedding cells at random.
+    library_key
+        ``.obs`` column identifying each cell's library (10x channel); simulated doublets pair cells
+        of the same library. Pass None to let any two cells pair.
+    fit_cells
+        Cells to build the embedding, the neighbour pool and the simulated doublets from: a boolean
+        ``.obs`` column name, a boolean array, or any selector accepted by :func:`detect_outliers`.
+        Defaults to all cells. Every cell is scored either way.
+    layer, use_raw
+        Where the counts are, as in :func:`detect_lineage_mixing`.
+    gene_mask
+        Genes allowed in the embedding: the name of a boolean column of the count matrix's ``var``
+        or of ``adata.var`` (matched by gene name when the counts are in ``raw``), a boolean array
+        over the count matrix's genes, or a list of gene names. The default is the pipeline's robust
+        protein-coding autosomal genes. Pass None to use all genes except mitochondrial (``MT-``) and
+        ribosomal protein (``RPL``/``RPS``) genes; this lets lncRNAs and sex-chromosome genes such as
+        ``XIST`` into the embedding.
+    n_top_genes, n_pcs
+        Embedding size.
+    n_neighbors
+        Neighbours per cell; the score moves in steps of ``1 / n_neighbors``.
+    n_real, n_simulated
+        Numbers of real cells (capped at the number of ``fit_cells``) and simulated doublets in the
+        neighbour pool. Keep them equal, so that a score of 0.5 means as many simulated doublets as
+        real cells nearby.
+    hvg_cells_per_group, pca_cells_per_group
+        Cells per group used to choose the genes and to fit the PCA.
+    target_sum
+        Counts per cell after depth normalization, before log1p.
+    flag_rate
+        Fraction of cells to flag: those with the highest scores. Cells tied at the cut are flagged
+        too, so slightly more may be flagged. Ignored when ``threshold`` is given.
+    threshold
+        Fixed score at or above which a cell is flagged; overrides ``flag_rate``.
+    backend
+        ``"cpu"`` (exact search, NumPy, multithreaded), ``"gpu"`` (exact search, PyTorch with CUDA),
+        or ``"auto"`` (GPU if available). Both return the same neighbours up to floating-point ties.
+    n_jobs
+        CPU threads for ``backend="cpu"``; defaults to all cores.
+    chunk_size
+        Cells per block when streaming counts.
+    store_pca
+        Also write the embedding to ``.obsm[f"{key_added}_pca"]``.
+    key_added
+        Prefix of the output keys.
+    random_state
+        Seed for sampling cells and doublet pairs.
+
+    Writes
+    ------
+    ``adata.obs``: ``{key_added}_score`` (fraction of simulated doublets among the neighbours) and
+    ``{key_added}_flag`` (1 if flagged). ``adata.uns[key_added]``: parameters, the score cut used
+    (``threshold``), the genes, the embedding (``mean``, ``std``, ``zmean``, ``loadings``) and a
+    per-group summary.
+
+    Returns
+    -------
+    Per-group DataFrame (``groupby``, or one row ``"all"``) with cell counts, median score and the
+    flagged fraction.
+    """
+    if groupby is not None and groupby not in adata.obs.columns:
+        raise KeyError(f"`groupby`={groupby!r} not in adata.obs; pass groupby=None to sample cells at random.")
+    if library_key is not None and library_key not in adata.obs.columns:
+        raise KeyError(
+            f"`library_key`={library_key!r} not in adata.obs; pass the column that identifies each cell's "
+            "library, or library_key=None to let any two cells pair."
+        )
+    if threshold is None and not 0 < flag_rate < 1:
+        raise ValueError("`flag_rate` must be between 0 and 1.")
+    if n_neighbors < 1 or n_pcs < 1 or n_top_genes < n_pcs:
+        raise ValueError("Need n_neighbors >= 1, n_pcs >= 1 and n_top_genes >= n_pcs.")
+    if n_real < n_neighbors or n_simulated < 1:
+        raise ValueError("Need n_real >= n_neighbors and n_simulated >= 1.")
+    if target_sum is None or not target_sum > 0:
+        raise ValueError("`target_sum` must be positive.")
+    backend, device = _resolve_knn_backend(backend)
+    n_jobs = (os.cpu_count() or 1) if n_jobs is None else max(1, int(n_jobs))
+
+    start_time = time.perf_counter()
+    rng = np.random.default_rng(random_state)
+    M, gene_names, rows = _mixing_counts_matrix(adata, layer, use_raw)
+    n_obs, n_genes = adata.n_obs, M.shape[1]
+    if (M.shape[0] if rows is None else rows.size) != n_obs:
+        raise ValueError("Count matrix rows do not match `adata.n_obs`.")
+    gene_names = pd.Index(gene_names).astype(str)
+
+    # ---- genes allowed in the embedding ----
+    if gene_mask is None:
+        allowed = ~np.asarray(gene_names.str.match(r"^(MT-|mt-|RP[LS]\d|Rp[ls]\d)"), dtype=bool)
+    elif isinstance(gene_mask, str):
+        raw_used = layer is None and (use_raw if use_raw is not None else adata.raw is not None)
+        count_var = adata.raw.var if raw_used else adata.var
+        if gene_mask in count_var.columns:
+            allowed = count_var[gene_mask].to_numpy(dtype=bool)
+        elif raw_used and gene_mask in adata.var.columns:
+            # raw.var often has no columns; take adata.var's, matched to the count matrix by gene name
+            column = adata.var[gene_mask].to_numpy(dtype=bool)
+            var_names = pd.Index(adata.var_names).astype(str)
+            if var_names.equals(gene_names):
+                allowed = column
+            else:
+                allowed = pd.Series(column, index=var_names).reindex(gene_names, fill_value=False).to_numpy(dtype=bool)
+        else:
+            raise KeyError(
+                f"`gene_mask`={gene_mask!r} is not a column of adata.var or of the count matrix's var; pass a "
+                "boolean column, a gene list, or gene_mask=None for all genes except MT-/RPL/RPS."
+            )
+    else:
+        allowed = np.asarray(gene_mask)
+        if allowed.dtype != bool:
+            allowed = np.asarray(gene_names.isin([str(g) for g in gene_mask]), dtype=bool)
+    if allowed.shape[0] != n_genes:
+        raise ValueError(f"`gene_mask` must cover the {n_genes} genes of the count matrix.")
+
+    # ---- fit cells, groups, libraries ----
+    if fit_cells is None:
+        is_fit = np.ones(n_obs, dtype=bool)
+    elif isinstance(fit_cells, str):
+        if fit_cells not in adata.obs.columns:
+            raise KeyError(f"`fit_cells`={fit_cells!r} not in adata.obs.")
+        is_fit = adata.obs[fit_cells].to_numpy(dtype=bool)
+    else:
+        is_fit = _as_obs_mask(adata, fit_cells, name="fit_cells")
+    fit_idx = np.flatnonzero(is_fit)
+    if fit_idx.size < max(n_neighbors + 1, 3):
+        raise ValueError(f"Need more fit cells than n_neighbors; found {fit_idx.size}.")
+    group_codes = (
+        adata.obs[groupby].astype("category").cat.codes.to_numpy() if groupby is not None else np.zeros(n_obs, dtype=int)
+    )
+    lib_codes = (
+        adata.obs[library_key].astype("category").cat.codes.to_numpy() if library_key is not None else np.zeros(n_obs, dtype=int)
+    )
+
+    def balanced(per_group):
+        picks = []
+        for code in np.unique(group_codes[fit_idx]):
+            if code < 0:
+                continue
+            members = fit_idx[group_codes[fit_idx] == code]
+            picks.append(rng.permutation(members)[:per_group])
+        return np.sort(np.concatenate(picks)) if picks else np.zeros(0, dtype=int)
+
+    hvg_cells = balanced(hvg_cells_per_group)
+    pca_cells = balanced(pca_cells_per_group)
+    if hvg_cells.size < 2 or pca_cells.size <= n_pcs:
+        raise ValueError("Too few fit cells with a `groupby` label to fit the embedding.")
+
+    # the pool's real cells, and simulated doublet pairs (within library, libraries weighted by n^2)
+    real_cells = np.sort(rng.choice(fit_idx, size=min(n_real, fit_idx.size), replace=False))
+    lib_members = pd.Series(fit_idx).groupby(lib_codes[fit_idx]).apply(np.asarray)
+    lib_members = lib_members[(lib_members.map(len) >= 2) & (lib_members.index >= 0)]  # -1: no library label
+    if lib_members.empty:
+        raise ValueError("No library has two fit cells to pair into simulated doublets.")
+    weights = lib_members.map(len).to_numpy(dtype=float) ** 2
+    per_lib = rng.multinomial(n_simulated, weights / weights.sum())
+    parent_a, parent_b = [], []
+    for members, count in zip(lib_members.to_numpy(), per_lib):
+        if count:
+            first = rng.integers(0, len(members), count)
+            second = (first + rng.integers(1, len(members), count)) % len(members)
+            parent_a.append(members[first])
+            parent_b.append(members[second])
+    parent_a, parent_b = np.concatenate(parent_a), np.concatenate(parent_b)
+    logger.info(
+        "detect_residual_doublets: %d fit cells; pool of %d real cells and %d simulated doublets from %d libraries; "
+        "backend %s.",
+        fit_idx.size, real_cells.size, parent_a.size, len(lib_members), backend,
+    )
+
+    # ---- pass 1: totals of every cell; moments of log-normalized values on the gene-selection cells ----
+    totals = np.zeros(n_obs)
+    sums, sumsq = np.zeros(n_genes), np.zeros(n_genes)
+    in_hvg = np.zeros(n_obs, dtype=bool)
+    in_hvg[hvg_cells] = True
+    checked = False
+    for start, end, block in _iter_row_chunks(M, chunk_size, rows):
+        if not checked and block.nnz:
+            sample = block.data[: min(block.nnz, 100_000)]
+            if not np.allclose(sample, np.round(sample)):
+                raise ValueError(
+                    "detect_residual_doublets expects raw counts; the selected matrix has non-integer values. "
+                    "Use `use_raw=True` or `layer=` to point at counts."
+                )
+            checked = True
+        totals[start:end] = np.asarray(block.sum(1)).ravel()
+        picked = np.flatnonzero(in_hvg[start:end])
+        if picked.size:
+            logged = _log_normalize_rows(block[picked], totals[start:end][picked], None, target_sum).astype(np.float64)
+            sums += np.asarray(logged.sum(0)).ravel()
+            sumsq += np.asarray(logged.multiply(logged).sum(0)).ravel()
+    genes = _cell_ranger_hvg(sums, sumsq, hvg_cells.size, n_top_genes, allowed)
+    if genes.size <= n_pcs:
+        raise ValueError(f"Only {genes.size} genes available for {n_pcs} principal components.")
+
+    # ---- pass 2: gene-subset counts of the PCA cells and of the doublet parents ----
+    needed = np.union1d(pca_cells, np.union1d(parent_a, parent_b))
+    is_needed = np.zeros(n_obs, dtype=bool)
+    is_needed[needed] = True
+    kept = []
+    for start, end, block in _iter_row_chunks(M, chunk_size, rows):
+        picked = np.flatnonzero(is_needed[start:end])
+        if picked.size:
+            kept.append(sparse.csr_matrix(block[picked][:, genes], dtype=np.float32))
+    H = sparse.vstack(kept, format="csr")
+    row_of = np.full(n_obs, -1, dtype=np.int64)
+    row_of[needed] = np.arange(needed.size)
+
+    # ---- embedding: standardize (clip 10) and PCA on the PCA cells ----
+    pca_rows = row_of[pca_cells]
+    Xp = _log_normalize_rows(H[pca_rows], totals[pca_cells], None, target_sum).astype(np.float64)
+    n_p = Xp.shape[0]
+    mean = np.asarray(Xp.sum(0)).ravel() / n_p
+    var = (np.asarray(Xp.multiply(Xp).sum(0)).ravel() - n_p * mean**2) / max(n_p - 1, 1)
+    model = {"mean": mean.astype(np.float32), "std": np.maximum(np.sqrt(np.maximum(var, 0)), 1e-6).astype(np.float32), "clip": 10.0}
+    zsum = np.zeros(genes.size)
+    zcross = np.zeros((genes.size, genes.size))
+    for first in range(0, n_p, chunk_size):
+        Z = Xp[first : first + chunk_size].toarray().astype(np.float32)
+        Z -= model["mean"]
+        Z /= model["std"]
+        np.clip(Z, -10.0, 10.0, out=Z)
+        zsum += Z.sum(0, dtype=np.float64)
+        zcross += Z.T.astype(np.float64) @ Z.astype(np.float64)
+    zmean = zsum / n_p
+    cov = (zcross - n_p * np.outer(zmean, zmean)) / max(n_p - 1, 1)
+    evals, evecs = np.linalg.eigh(cov)
+    order = np.argsort(evals)[::-1][:n_pcs]
+    model["zmean"] = zmean.astype(np.float32)
+    model["loadings"] = np.ascontiguousarray(evecs[:, order], dtype=np.float32)
+    explained = evals[order] / max(evals.sum(), 1e-12)
+    del Xp, zcross, cov
+
+    # ---- pass 3: every cell's coordinates; simulated doublets' coordinates ----
+    pcs = np.zeros((n_obs, n_pcs), dtype=np.float32)
+    for start, end, block in _iter_row_chunks(M, chunk_size, rows):
+        pcs[start:end] = _project_rows(_log_normalize_rows(block, totals[start:end], genes, target_sum), model)
+    sim = np.zeros((parent_a.size, n_pcs), dtype=np.float32)
+    for first in range(0, parent_a.size, chunk_size):
+        a, b = parent_a[first : first + chunk_size], parent_b[first : first + chunk_size]
+        D = H[row_of[a]] + H[row_of[b]]
+        sim[first : first + chunk_size] = _project_rows(_log_normalize_rows(D, totals[a] + totals[b], None, target_sum), model)
+    del H
+
+    # ---- score: fraction of simulated doublets among each cell's nearest neighbours, self excluded ----
+    R = np.vstack([pcs[real_cells], sim])
+    is_sim = np.r_[np.zeros(real_cells.size, dtype=bool), np.ones(sim.shape[0], dtype=bool)]
+    self_index = np.full(n_obs, -1, dtype=np.int64)
+    self_index[real_cells] = np.arange(real_cells.size)
+    k1 = min(n_neighbors + 1, R.shape[0])
+    if backend == "gpu":
+        neighbours = _knn_torch(pcs, R, k1, device)
+    else:
+        neighbours = _knn_numpy(pcs, R, k1, n_jobs)
+    neighbours = _drop_self(neighbours, self_index)
+    score = is_sim[neighbours].mean(1).astype(np.float32)
+    fixed_threshold = threshold is not None
+    if not fixed_threshold:  # the score of the cell at rank flag_rate * n_obs from the top
+        threshold = float(np.quantile(score, 1.0 - flag_rate))
+    flag = score >= threshold if threshold > 0 else score > 0
+
+    # ---- write results ----
+    target, expand = _result_target(adata)
+    target.obs[f"{key_added}_score"] = expand(score, np.nan)
+    target.obs[f"{key_added}_flag"] = expand(flag.astype(int), 0)
+    if store_pca:
+        target.obsm[f"{key_added}_pca"] = expand(pcs, np.nan)
+
+    labels = adata.obs[groupby].astype(str).to_numpy() if groupby is not None else np.full(n_obs, "all", dtype=object)
+    frame = pd.DataFrame({"group": labels, "score": score, "flag": flag})
+    summary = (
+        frame.groupby("group", sort=True)
+        .agg(n_cells=("flag", "size"), median_score=("score", "median"), n_flagged=("flag", "sum"), flag_fraction=("flag", "mean"))
+        .reset_index()
+    )
+    target.uns[key_added] = {
+        "groupby": groupby,
+        "library_key": library_key,
+        "threshold": float(threshold),
+        "flag_rate": float("nan") if fixed_threshold else float(flag_rate),
+        "n_neighbors": int(n_neighbors),
+        "n_fit_cells": int(fit_idx.size),
+        "n_real": int(real_cells.size),
+        "n_simulated": int(parent_a.size),
+        "target_sum": float(target_sum),
+        "backend": backend,
+        "genes": gene_names[genes].to_numpy().astype(str),
+        "mean": model["mean"],
+        "std": model["std"],
+        "zmean": model["zmean"],
+        "loadings": model["loadings"],
+        "explained_variance_ratio": explained.astype(np.float32),
+        "group_summary": summary,
+    }
+    _refresh_view(adata)
+    logger.info(
+        "detect_residual_doublets: flagged %d of %d cells (%.2f%%) with score >= %.3f in %.1fs.",
+        int(flag.sum()), n_obs, 100.0 * flag.mean(), threshold, time.perf_counter() - start_time,
+    )
+    return summary
+
+
 __all__ = [
     "agg_by_cluster",
     "corrMat",
@@ -1750,6 +2254,7 @@ __all__ = [
     "diff_markers",
     "detect_lineage_mixing",
     "detect_outliers",
+    "detect_residual_doublets",
     "info",
     "l2_distance",
     "pb_agg_by_cluster",
