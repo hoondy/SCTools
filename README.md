@@ -364,27 +364,30 @@ channel) of each cell; the defaults are `"subclass"` and `"libraryID"`. Pass
 embedding cells at random.
 
 **`gene_mask`.** The genes the embedding may use. The default is the pipeline's
-`robust_protein_coding_autosome` column. It is read from the count matrix's
-`var`, or from `adata.var` (matched by gene name) when the counts are in `raw`
-and `raw.var` has no columns. A boolean array or a list of gene names also
-works. `gene_mask=None` uses all genes except `MT-`, `RPL` and `RPS` genes. That
-lets lncRNAs and sex-chromosome genes such as `XIST` into the embedding.
+`robust_protein_coding_autosome` column: robust protein-coding genes on the
+autosomes. It is read from the count matrix's `var`, or from `adata.var`
+(matched by gene name) when the counts are in `raw` and `raw.var` has no
+columns. A boolean array or a list of gene names also works. `gene_mask=None`
+uses all genes except `MT-`, `RPL` and `RPS` genes, which lets lncRNAs and
+sex-chromosome genes such as `XIST` into the embedding.
 
-In the internal benchmark, `gene_mask=None` was compared with the default at
-the same random seed:
+The default works better than `gene_mask=None`. The internal benchmark ran both
+with the same random seed, on synthetic doublets that each combined two nuclei
+from one library and had survived the earlier cleaning steps:
 
-- It replaced about a third of the highly variable genes, mostly with lncRNAs.
-- It changed which cells were flagged more than a different random seed did
-  (overlap 32% against 55%).
-- It ranked synthetic doublets lower among the real cells. Each synthetic
-  doublet combined two nuclei from one library, and only those that survived
-  the earlier cleaning steps were counted. The AUC was lower for every doublet
-  type, by 0.015–0.07, against at most 0.013 between random seeds.
-- At the 1% cut it flagged 5% more real cells, yet removed fewer doublets:
-  - 684 of 1,504 same-lineage doublets, against 705 (not significant);
-  - 54 of 1,313 cross-lineage doublets carrying 20% of a partner's counts,
-    against 74 (paired p = 0.015);
+- The default ranked synthetic doublets higher among the real cells for every
+  doublet type. Its AUC was higher by 0.015–0.07, while random seeds changed
+  the AUC by at most 0.013.
+- At the 1% cut the default flagged fewer real cells (7,160 against 7,517), yet
+  removed more doublets:
+  - 74 of 1,313 cross-lineage doublets carrying 20% of a partner's counts,
+    against 54 with `gene_mask=None` (paired p = 0.015);
+  - 705 of 1,504 same-lineage doublets, against 684 (not significant);
   - the other doublet types differed by at most two doublets.
+- The gene set changes the result more than the random seed does. The flagged
+  cells of the two gene sets overlapped by 32%, against 55% between seeds.
+  `gene_mask=None` replaced about a third of the 3,000 highly variable genes,
+  mostly with lncRNAs.
 
 **`flag_rate` or `threshold`.** `flag_rate=0.01` flags the 1% of cells with the
 highest scores. Cells tied at the cut are flagged too, so slightly more may be
