@@ -1880,75 +1880,80 @@ def _resolve_knn_backend(backend):
 
 
 def _drop_self(indices, self_index):
-    """Remove each query's own reference position from its k+1 sorted neighbours (else the farthest)."""
+    """Remove each query's own position in the pool from its k+1 sorted neighbours (else the farthest)."""
     is_self = indices == self_index[:, None]
     keep = ~is_self
     keep[~is_self.any(1), -1] = False
     return indices[keep].reshape(indices.shape[0], indices.shape[1] - 1)
 
 
-def detect_knn_doublets(
+def detect_residual_doublets(
     adata: ad.AnnData,
-    groupby: str = None,
-    library_key: str = None,
-    reference=None,
+    groupby: str = "subclass",
+    library_key: str = "libraryID",
+    fit_cells=None,
     layer: str = None,
     use_raw: bool = None,
     gene_mask=None,
     n_top_genes: int = 3000,
     n_pcs: int = 30,
     n_neighbors: int = 50,
-    n_reference: int = 200_000,
+    n_real: int = 200_000,
     n_simulated: int = 200_000,
     hvg_cells_per_group: int = 2000,
     pca_cells_per_group: int = 5000,
     target_sum: float = 1e4,
-    quantile: float = 0.99,
+    flag_rate: float = 0.01,
     threshold: float = None,
     backend: str = "auto",
     n_jobs: int = None,
     chunk_size: int = 20000,
     store_pca: bool = False,
-    key_added: str = "knn_doublet",
+    key_added: str = "residual_doublet",
     random_state: int = 0,
 ) -> pd.DataFrame:
-    """Flag doublets by their neighbourhood among simulated doublets, pooled over all libraries.
+    """Flag doublets left after cleaning: cells whose nearest neighbours are mostly simulated doublets.
 
     Run this after the per-library doublet step and cleaning (e.g. Scrublet, then
     :func:`detect_lineage_mixing` and :func:`detect_outliers`), on the cells you intend to keep.
-    It is the Scrublet idea applied once to the whole dataset:
+    It applies the Scrublet idea once to the whole dataset instead of library by library:
 
     1. Embedding: ``n_top_genes`` highly variable genes (Scanpy ``flavor="cell_ranger"`` on
-       log1p(count / total * ``target_sum``)) chosen on up to ``hvg_cells_per_group`` reference cells
-       per ``groupby`` group, standardized (clipped at 10) and reduced to ``n_pcs`` principal
-       components fitted on up to ``pca_cells_per_group`` reference cells per group. Balancing by
-       group keeps rare types resolved.
-    2. Reference: ``n_reference`` random reference cells as singlets, plus ``n_simulated`` doublets
-       made by summing the counts of two random reference cells of the same library
+       log1p(count / total * ``target_sum``)) chosen on up to ``hvg_cells_per_group`` cells per
+       ``groupby`` group, standardized (clipped at 10) and reduced to ``n_pcs`` principal
+       components fitted on up to ``pca_cells_per_group`` cells per group. Balancing by group keeps
+       rare types resolved.
+    2. Neighbour pool: ``n_real`` random real cells plus ``n_simulated`` simulated doublets. Each
+       simulated doublet is the summed counts of two random cells of the same library
        (``library_key``). Libraries are drawn with probability proportional to the square of their
-       number of reference cells, as doublets scale with loading.
+       number of cells, as doublets scale with loading.
     3. Score: the fraction of simulated doublets among each cell's ``n_neighbors`` nearest
-       neighbours in the embedding (a cell is never its own neighbour).
-    4. Flag: cells scoring at or above ``threshold``; by default the ``quantile`` of the reference
-       cells' own scores (cells above 0 when that quantile is 0).
+       neighbours in the pool (a cell is never its own neighbour). It measures how close a cell
+       sits to simulated doublets rather than to real cells: 0 when all its neighbours are real
+       cells, 1 when all are simulated doublets. It is not a distance to clusters.
+    4. Flag: the ``flag_rate`` fraction of cells with the highest scores (1% by default), or the
+       cells scoring at or above a fixed ``threshold``. The default is a rate rather than a fixed
+       score because simulated doublets of two cells of the same type land inside that type's
+       cluster, so ordinary cells of large clusters score well above 0.
 
-    The reference cells are the singlets, the doublet parents and the cells the embedding is fitted
-    on; every cell in ``adata`` is scored. Because both the reference and the simulated doublets come
-    from the data, no external annotation is needed.
+    Steps 1 and 2 use ``fit_cells`` (all cells by default); every cell in ``adata`` is scored. Both
+    the real cells and the simulated doublets come from the data, so no external annotation is
+    needed.
 
     Parameters
     ----------
     adata
         AnnData with raw counts; may be backed or a view of a backed AnnData.
     groupby
-        ``.obs`` column of cell-type labels used to balance the embedding. Optional; without it the
-        embedding cells are a random sample.
+        ``.obs`` column of cell-type labels used to balance the embedding. Pass None to sample the
+        embedding cells at random.
     library_key
         ``.obs`` column identifying each cell's library (10x channel); simulated doublets pair cells
-        of the same library. Optional; without it, any two reference cells can pair.
-    reference
-        Cells to use as the reference: a boolean ``.obs`` column name, a boolean array, or any
-        selector accepted by :func:`detect_outliers`. Defaults to all cells.
+        of the same library. Pass None to let any two cells pair.
+    fit_cells
+        Cells to build the embedding, the neighbour pool and the simulated doublets from: a boolean
+        ``.obs`` column name, a boolean array, or any selector accepted by :func:`detect_outliers`.
+        Defaults to all cells. Every cell is scored either way.
     layer, use_raw
         Where the counts are, as in :func:`detect_lineage_mixing`.
     gene_mask
@@ -1959,17 +1964,19 @@ def detect_knn_doublets(
         Embedding size.
     n_neighbors
         Neighbours per cell; the score moves in steps of ``1 / n_neighbors``.
-    n_reference, n_simulated
-        Numbers of reference singlets and simulated doublets (capped at the number of reference
-        cells for singlets). Keep them equal so a score of 0.5 means an even neighbourhood.
+    n_real, n_simulated
+        Numbers of real cells (capped at the number of ``fit_cells``) and simulated doublets in the
+        neighbour pool. Keep them equal, so that a score of 0.5 means as many simulated doublets as
+        real cells nearby.
     hvg_cells_per_group, pca_cells_per_group
-        Reference cells per group used to choose genes and fit the PCA.
+        Cells per group used to choose the genes and to fit the PCA.
     target_sum
         Counts per cell after depth normalization, before log1p.
-    quantile
-        Quantile of the reference cells' scores used as the threshold when ``threshold`` is None.
+    flag_rate
+        Fraction of cells to flag: those with the highest scores. Cells tied at the cut are flagged
+        too, so slightly more may be flagged. Ignored when ``threshold`` is given.
     threshold
-        Score at or above which a cell is flagged; overrides ``quantile``.
+        Fixed score at or above which a cell is flagged; overrides ``flag_rate``.
     backend
         ``"cpu"`` (exact search, NumPy, multithreaded), ``"gpu"`` (exact search, PyTorch with CUDA),
         or ``"auto"`` (GPU if available). Both return the same neighbours up to floating-point ties.
@@ -1987,8 +1994,9 @@ def detect_knn_doublets(
     Writes
     ------
     ``adata.obs``: ``{key_added}_score`` (fraction of simulated doublets among the neighbours) and
-    ``{key_added}_flag`` (1 if flagged). ``adata.uns[key_added]``: parameters, threshold, the genes,
-    the embedding (``mean``, ``std``, ``zmean``, ``loadings``) and a per-group summary.
+    ``{key_added}_flag`` (1 if flagged). ``adata.uns[key_added]``: parameters, the score cut used
+    (``threshold``), the genes, the embedding (``mean``, ``std``, ``zmean``, ``loadings``) and a
+    per-group summary.
 
     Returns
     -------
@@ -1996,15 +2004,18 @@ def detect_knn_doublets(
     flagged fraction.
     """
     if groupby is not None and groupby not in adata.obs.columns:
-        raise KeyError(f"`groupby`={groupby!r} not in adata.obs.")
+        raise KeyError(f"`groupby`={groupby!r} not in adata.obs; pass groupby=None to sample cells at random.")
     if library_key is not None and library_key not in adata.obs.columns:
-        raise KeyError(f"`library_key`={library_key!r} not in adata.obs.")
-    if threshold is None and not 0 < quantile < 1:
-        raise ValueError("`quantile` must be between 0 and 1.")
+        raise KeyError(
+            f"`library_key`={library_key!r} not in adata.obs; pass the column that identifies each cell's "
+            "library, or library_key=None to let any two cells pair."
+        )
+    if threshold is None and not 0 < flag_rate < 1:
+        raise ValueError("`flag_rate` must be between 0 and 1.")
     if n_neighbors < 1 or n_pcs < 1 or n_top_genes < n_pcs:
         raise ValueError("Need n_neighbors >= 1, n_pcs >= 1 and n_top_genes >= n_pcs.")
-    if n_reference < n_neighbors or n_simulated < 1:
-        raise ValueError("Need n_reference >= n_neighbors and n_simulated >= 1.")
+    if n_real < n_neighbors or n_simulated < 1:
+        raise ValueError("Need n_real >= n_neighbors and n_simulated >= 1.")
     if target_sum is None or not target_sum > 0:
         raise ValueError("`target_sum` must be positive.")
     backend, device = _resolve_knn_backend(backend)
@@ -2034,18 +2045,18 @@ def detect_knn_doublets(
     if allowed.shape[0] != n_genes:
         raise ValueError(f"`gene_mask` must cover the {n_genes} genes of the count matrix.")
 
-    # ---- reference cells, groups, libraries ----
-    if reference is None:
-        is_ref = np.ones(n_obs, dtype=bool)
-    elif isinstance(reference, str):
-        if reference not in adata.obs.columns:
-            raise KeyError(f"`reference`={reference!r} not in adata.obs.")
-        is_ref = adata.obs[reference].to_numpy(dtype=bool)
+    # ---- fit cells, groups, libraries ----
+    if fit_cells is None:
+        is_fit = np.ones(n_obs, dtype=bool)
+    elif isinstance(fit_cells, str):
+        if fit_cells not in adata.obs.columns:
+            raise KeyError(f"`fit_cells`={fit_cells!r} not in adata.obs.")
+        is_fit = adata.obs[fit_cells].to_numpy(dtype=bool)
     else:
-        is_ref = _as_obs_mask(adata, reference, name="reference")
-    ref_cells = np.flatnonzero(is_ref)
-    if ref_cells.size < max(n_neighbors + 1, 3):
-        raise ValueError(f"Need more reference cells than n_neighbors; found {ref_cells.size}.")
+        is_fit = _as_obs_mask(adata, fit_cells, name="fit_cells")
+    fit_idx = np.flatnonzero(is_fit)
+    if fit_idx.size < max(n_neighbors + 1, 3):
+        raise ValueError(f"Need more fit cells than n_neighbors; found {fit_idx.size}.")
     group_codes = (
         adata.obs[groupby].astype("category").cat.codes.to_numpy() if groupby is not None else np.zeros(n_obs, dtype=int)
     )
@@ -2055,24 +2066,24 @@ def detect_knn_doublets(
 
     def balanced(per_group):
         picks = []
-        for code in np.unique(group_codes[ref_cells]):
+        for code in np.unique(group_codes[fit_idx]):
             if code < 0:
                 continue
-            members = ref_cells[group_codes[ref_cells] == code]
+            members = fit_idx[group_codes[fit_idx] == code]
             picks.append(rng.permutation(members)[:per_group])
         return np.sort(np.concatenate(picks)) if picks else np.zeros(0, dtype=int)
 
     hvg_cells = balanced(hvg_cells_per_group)
     pca_cells = balanced(pca_cells_per_group)
     if hvg_cells.size < 2 or pca_cells.size <= n_pcs:
-        raise ValueError("Too few reference cells with a `groupby` label to fit the embedding.")
+        raise ValueError("Too few fit cells with a `groupby` label to fit the embedding.")
 
-    # singlets and simulated doublet pairs (within library, libraries weighted by n^2)
-    singlets = np.sort(rng.choice(ref_cells, size=min(n_reference, ref_cells.size), replace=False))
-    lib_members = pd.Series(ref_cells).groupby(lib_codes[ref_cells]).apply(np.asarray)
+    # the pool's real cells, and simulated doublet pairs (within library, libraries weighted by n^2)
+    real_cells = np.sort(rng.choice(fit_idx, size=min(n_real, fit_idx.size), replace=False))
+    lib_members = pd.Series(fit_idx).groupby(lib_codes[fit_idx]).apply(np.asarray)
     lib_members = lib_members[(lib_members.map(len) >= 2) & (lib_members.index >= 0)]  # -1: no library label
     if lib_members.empty:
-        raise ValueError("No library has two reference cells to pair into simulated doublets.")
+        raise ValueError("No library has two fit cells to pair into simulated doublets.")
     weights = lib_members.map(len).to_numpy(dtype=float) ** 2
     per_lib = rng.multinomial(n_simulated, weights / weights.sum())
     parent_a, parent_b = [], []
@@ -2084,8 +2095,9 @@ def detect_knn_doublets(
             parent_b.append(members[second])
     parent_a, parent_b = np.concatenate(parent_a), np.concatenate(parent_b)
     logger.info(
-        "detect_knn_doublets: %d reference cells, %d singlets, %d simulated doublets from %d libraries; backend %s.",
-        ref_cells.size, singlets.size, parent_a.size, len(lib_members), backend,
+        "detect_residual_doublets: %d fit cells; pool of %d real cells and %d simulated doublets from %d libraries; "
+        "backend %s.",
+        fit_idx.size, real_cells.size, parent_a.size, len(lib_members), backend,
     )
 
     # ---- pass 1: totals of every cell; moments of log-normalized values on the gene-selection cells ----
@@ -2099,7 +2111,7 @@ def detect_knn_doublets(
             sample = block.data[: min(block.nnz, 100_000)]
             if not np.allclose(sample, np.round(sample)):
                 raise ValueError(
-                    "detect_knn_doublets expects raw counts; the selected matrix has non-integer values. "
+                    "detect_residual_doublets expects raw counts; the selected matrix has non-integer values. "
                     "Use `use_raw=True` or `layer=` to point at counts."
                 )
             checked = True
@@ -2163,10 +2175,10 @@ def detect_knn_doublets(
     del H
 
     # ---- kNN score: fraction of simulated doublets among the neighbours, self excluded ----
-    R = np.vstack([pcs[singlets], sim])
-    is_sim = np.r_[np.zeros(singlets.size, dtype=bool), np.ones(sim.shape[0], dtype=bool)]
+    R = np.vstack([pcs[real_cells], sim])
+    is_sim = np.r_[np.zeros(real_cells.size, dtype=bool), np.ones(sim.shape[0], dtype=bool)]
     self_index = np.full(n_obs, -1, dtype=np.int64)
-    self_index[singlets] = np.arange(singlets.size)
+    self_index[real_cells] = np.arange(real_cells.size)
     k1 = min(n_neighbors + 1, R.shape[0])
     if backend == "gpu":
         neighbours = _knn_torch(pcs, R, k1, device)
@@ -2174,8 +2186,9 @@ def detect_knn_doublets(
         neighbours = _knn_numpy(pcs, R, k1, n_jobs)
     neighbours = _drop_self(neighbours, self_index)
     score = is_sim[neighbours].mean(1).astype(np.float32)
-    if threshold is None:
-        threshold = float(np.quantile(score[is_ref], quantile))
+    fixed_threshold = threshold is not None
+    if not fixed_threshold:  # the score of the cell at rank flag_rate * n_obs from the top
+        threshold = float(np.quantile(score, 1.0 - flag_rate))
     flag = score >= threshold if threshold > 0 else score > 0
 
     # ---- write results ----
@@ -2196,10 +2209,10 @@ def detect_knn_doublets(
         "groupby": groupby,
         "library_key": library_key,
         "threshold": float(threshold),
-        "quantile": float(quantile),
+        "flag_rate": float("nan") if fixed_threshold else float(flag_rate),
         "n_neighbors": int(n_neighbors),
-        "n_reference_cells": int(ref_cells.size),
-        "n_singlets": int(singlets.size),
+        "n_fit_cells": int(fit_idx.size),
+        "n_real": int(real_cells.size),
         "n_simulated": int(parent_a.size),
         "target_sum": float(target_sum),
         "backend": backend,
@@ -2213,7 +2226,7 @@ def detect_knn_doublets(
     }
     _refresh_view(adata)
     logger.info(
-        "detect_knn_doublets: flagged %d of %d cells (%.2f%%) with score >= %.3f in %.1fs.",
+        "detect_residual_doublets: flagged %d of %d cells (%.2f%%) with score >= %.3f in %.1fs.",
         int(flag.sum()), n_obs, 100.0 * flag.mean(), threshold, time.perf_counter() - start_time,
     )
     return summary
@@ -2224,9 +2237,9 @@ __all__ = [
     "corrMat",
     "cos_similarity",
     "diff_markers",
-    "detect_knn_doublets",
     "detect_lineage_mixing",
     "detect_outliers",
+    "detect_residual_doublets",
     "info",
     "l2_distance",
     "pb_agg_by_cluster",
