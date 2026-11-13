@@ -68,7 +68,7 @@ See [Working with large H5AD files](#working-with-large-h5ad-files) for examples
 
 | Function | What it does |
 | --- | --- |
-| `detect_outliers` | Flag cells that sit apart from their annotation group in an embedding ([details](#outlier-detection)) |
+| `detect_outliers` | Flag cells that sit apart from their annotation group, or among cells of another group, in an embedding ([details](#outlier-detection)) |
 | `detect_lineage_mixing` | Flag heterotypic doublets and cross-lineage contamination ([details](#lineage-mixing-detection-heterotypic-doublets-and-contamination)) |
 | `detect_residual_doublets` | Flag doublets left after cleaning, scored by how many of a cell's nearest neighbours are simulated doublets; CPU or GPU ([details](#residual-doublet-detection-after-cleaning)) |
 | `pls`, `pls_score` | Supervised embedding and per-cell disease score with partial least squares ([details](#pls-supervised-disease-axis)) |
@@ -146,13 +146,53 @@ an outlier. You can also pass a boolean mask, or a function that takes
 | Output | Contents |
 | --- | --- |
 | `adata.obs["outlier"]` | 1 for outliers, 0 otherwise |
-| `adata.obs["outlier_method"]` | How each cell was labeled, such as `dbscan`, `lof`, `skipped_small_group`, or `forced_outlier` |
+| `adata.obs["outlier_method"]` | How each cell was labeled, such as `dbscan`, `lof`, `neighbor_label`, `skipped_small_group`, or `forced_outlier` |
 | `adata.obs["outlier_score"]` | Model score; higher means more outlying |
 | `adata.obs["outlier_dbscan_label"]` | DBSCAN cluster label; -1 means noise |
+| `adata.obs["outlier_neighbor_label"]` | `neighbor_label` only: the most common label among the neighbours |
 | `adata.uns["outlier_detection"]` | Parameters and the per-group summary |
 | Return value | Per-group method, parameter, and outlier counts |
 
 Only `adata.obs["outlier"]` is written when `store_details=False`.
+
+### Cells among another label (`method="neighbor_label"`)
+
+DBSCAN and LOF model each group on its own, so they cannot see a cell that
+sits inside another group's island. `method="neighbor_label"` checks this
+directly. It finds each cell's `label_n_neighbors` nearest cells in `use_rep`,
+across all groups, and flags the cell when fewer than `label_min_agreement` of
+them share its `groupby` label. With the defaults, 15 and 1/3, a cell is
+flagged when at most 4 of its 15 nearest cells share its label. A UMAP places
+each cell from its 15 nearest neighbours by default, so these are the cells
+drawn inside another group's island.
+
+The default cut was chosen on human cortex data: cells were re-embedded without
+removal, and the share that ended up away from their group in the final UMAP was
+measured at each count. Cells with 4 or fewer of 15 neighbours sharing their
+label ended up away from their group more often than not. Cells with 5 to 7 did
+so less than half the time, so a majority cut (`label_min_agreement=0.5`) also
+removes cells that would have stayed with their group.
+
+```python
+summary = sct.tl.detect_outliers(
+    adata[adata.obs["keep"]],     # score only these cells; the others are not neighbours either
+    groupby="subclass",
+    use_rep="X_pca_harmony",
+    method="neighbor_label",
+)
+```
+
+- Neighbours are exact (Euclidean). `backend="auto"` uses a GPU when PyTorch
+  sees one; the CPU path needs only NumPy.
+- `adata.obs["outlier_score"]` is the share of neighbours with another label
+  (0 to 1), and `adata.obs["outlier_neighbor_label"]` is the most common label
+  among them.
+- Groups smaller than `min_group_size` are not scored, but their cells still
+  count as neighbours.
+- The result does not depend on group size. A small subtype that sits apart
+  from the rest of its subclass is kept, because its neighbours share its
+  label. With LOF, a group smaller than the number of neighbours that sits
+  apart is trimmed as a whole.
 
 **Choosing an embedding.** UMAP is good at catching visually obvious islands,
 but its distances are not comparable across the map. For production filtering,
