@@ -396,6 +396,35 @@ def _refresh_view(adata):
         adata._init_as_view(adata._adata_ref, adata._oidx, adata._vidx)
 
 
+def _neighbor_label_agreement(X, codes, n_neighbors, *, metric, backend, n_jobs, NearestNeighbors):
+    """For each row of ``X``: the share of its ``n_neighbors`` nearest rows (itself excluded) whose label code equals
+    its own, and the most common label code among those neighbours (ties go to the lower code).
+
+    Euclidean neighbours are exact: blocked NumPy on the CPU, or PyTorch on a GPU (``backend``). Other metrics use
+    scikit-learn's NearestNeighbors.
+    """
+    n = X.shape[0]
+    k = min(int(n_neighbors), n - 1)
+    if metric == "euclidean":
+        kind, device = _resolve_knn_backend(backend)
+        if kind == "gpu":
+            nn = _knn_torch(X, X, k + 1, device)
+        else:
+            workers = (os.cpu_count() or 1) if n_jobs is None or n_jobs < 1 else int(n_jobs)
+            nn = _knn_numpy(X, X, k + 1, workers)
+    else:
+        nn = NearestNeighbors(n_neighbors=k + 1, metric=metric, n_jobs=n_jobs).fit(X).kneighbors(X, return_distance=False)
+    # A cell is not its own neighbour. With duplicated coordinates it need not come first, so _drop_self removes it
+    # wherever it is (or the farthest of the k + 1 when it is missing).
+    nn = _drop_self(nn, np.arange(n))
+    neighbour_codes = codes[nn]
+    agreement = (neighbour_codes == codes[:, None]).mean(axis=1)
+    n_labels = int(codes.max()) + 1
+    counts = np.bincount((np.arange(n)[:, None] * n_labels + neighbour_codes).ravel(), minlength=n * n_labels)
+    majority = counts.reshape(n, n_labels).argmax(axis=1)
+    return agreement, majority
+
+
 def detect_outliers(
     adata: ad.AnnData,
     groupby: str = "subclass",
@@ -415,6 +444,9 @@ def detect_outliers(
     lof_n_neighbors_min: int = 100,
     lof_n_neighbors_max: int = 4_000,
     lof_contamination="auto",
+    label_n_neighbors: int = 15,
+    label_min_agreement: float = 1 / 3,
+    backend: str = "auto",
     metric: str = "euclidean",
     n_jobs: int = -1,
     force_outlier=None,
@@ -430,6 +462,14 @@ def detect_outliers(
     ordinary-size groups, and LocalOutlierFactor is used for groups above
     ``large_group_threshold`` to avoid building a very large radius graph.
 
+    ``method="neighbor_label"`` asks a different question: does the cell sit
+    among cells of its own label? It finds each cell's ``label_n_neighbors``
+    nearest cells in ``use_rep`` across all groups, and flags the cell when
+    fewer than ``label_min_agreement`` of them share its ``groupby`` label.
+    Such cells are drawn inside another group's island on a UMAP built from the
+    same neighbours. The density methods fit each group on its own, so they
+    cannot see where a cell sits relative to other groups.
+
     ``adata.obs[outlier_key]`` is written as an integer 0/1 label where 1 means
     outlier. A per-group summary DataFrame is returned and, by default, stored
     with parameters in ``adata.uns[diagnostics_key]``.
@@ -444,12 +484,26 @@ def detect_outliers(
         ``"unassigned"``).
     groupby
         Observation column used to fit separate outlier models. Set to ``None``
-        to fit one model across all cells.
+        to fit one model across all cells. For ``"neighbor_label"`` it is the
+        label compared with the neighbours' labels, and it is required.
     use_rep
         Key in ``adata.obsm`` to use as the outlier-detection embedding.
     method
-        ``"auto"``, ``"dbscan"``, or ``"lof"``. ``"auto"`` switches to LOF only
-        for groups larger than ``large_group_threshold``.
+        ``"auto"``, ``"dbscan"``, ``"lof"``, or ``"neighbor_label"``.
+        ``"auto"`` switches to LOF only for groups larger than
+        ``large_group_threshold``.
+    label_n_neighbors, label_min_agreement
+        ``"neighbor_label"`` only: a cell is an outlier when fewer than
+        ``label_min_agreement`` of its ``label_n_neighbors`` nearest cells (the
+        cell itself excluded) share its label. With the defaults, 15 and 1/3,
+        a cell is flagged when at most 4 of its 15 nearest cells share its
+        label. 15 is the number of neighbours a UMAP uses by default. Cells of
+        groups smaller than ``min_group_size`` still count as neighbours, but
+        are not scored.
+    backend
+        ``"neighbor_label"`` with Euclidean ``metric`` only: ``"auto"`` (GPU
+        when PyTorch sees one, else CPU), ``"cpu"`` or ``"gpu"``. Neighbours are
+        exact either way.
     force_outlier, force_inlier
         Optional manual overrides. Pass a boolean mask, callable returning a
         mask, or a dict such as
@@ -459,12 +513,22 @@ def detect_outliers(
         or ``"inlier"``.
     store_details
         If True, also writes method, score, and DBSCAN cluster labels to
-        ``adata.obs`` and stores diagnostics in ``adata.uns``.
+        ``adata.obs`` and stores diagnostics in ``adata.uns``. For
+        ``"neighbor_label"`` the score is the share of neighbours with another
+        label, and ``adata.obs[outlier_key + "_neighbor_label"]`` is the most
+        common label among the neighbours.
     """
     if use_rep not in adata.obsm:
         raise KeyError(f"`{use_rep}` not found in `adata.obsm`.")
-    if method not in {"auto", "dbscan", "lof"}:
-        raise ValueError("`method` must be one of 'auto', 'dbscan', or 'lof'.")
+    if method not in {"auto", "dbscan", "lof", "neighbor_label"}:
+        raise ValueError("`method` must be one of 'auto', 'dbscan', 'lof', or 'neighbor_label'.")
+    if method == "neighbor_label":
+        if groupby is None:
+            raise ValueError("`method='neighbor_label'` compares each cell's `groupby` label with its neighbours'; set `groupby`.")
+        if int(label_n_neighbors) < 1:
+            raise ValueError("`label_n_neighbors` must be positive.")
+        if not 0 < label_min_agreement <= 1:
+            raise ValueError("`label_min_agreement` must be in (0, 1].")
     if invalid_policy not in {"outlier", "inlier"}:
         raise ValueError("`invalid_policy` must be 'outlier' or 'inlier'.")
     if dbscan_eps <= 0:
@@ -491,6 +555,25 @@ def detect_outliers(
     score = np.full(adata.n_obs, np.nan, dtype=np.float64)
     dbscan_label = np.full(adata.n_obs, pd.NA, dtype=object)
     rows = []
+
+    if method == "neighbor_label":
+        # One neighbour search over all cells with a finite embedding, across groups: the question is which labels
+        # surround a cell, not how dense its own group is around it.
+        codes = np.full(adata.n_obs, -1, dtype=np.int64)
+        group_names = []
+        for code, (group_name, positions) in enumerate(_iter_obs_groups(adata.obs, groupby)):
+            codes[positions] = code
+            group_names.append(group_name)
+        pool = np.flatnonzero(np.isfinite(X).all(axis=1))
+        label_k = min(int(label_n_neighbors), max(pool.size - 1, 0))
+        agreement = np.full(adata.n_obs, np.nan)
+        neighbor_label = np.full(adata.n_obs, None, dtype=object)
+        if label_k >= 1:
+            pool_agreement, pool_majority = _neighbor_label_agreement(
+                X[pool], codes[pool], label_k, metric=metric, backend=backend, n_jobs=n_jobs, NearestNeighbors=NearestNeighbors
+            )
+            agreement[pool] = pool_agreement
+            neighbor_label[pool] = np.asarray(group_names, dtype=object)[pool_majority]
 
     for group_name, positions in _iter_obs_groups(adata.obs, groupby):
         group_X = X[positions]
@@ -589,6 +672,23 @@ def detect_outliers(
                     "n_outliers": int(group_outlier.sum() + outlier[invalid_positions].sum()),
                 }
             )
+        elif chosen == "neighbor_label":
+            # Default cut 1/3 (at most 4 of 15): in human cortex data re-embedded after removal, cells at or
+            # below it were more likely than not to end up away from their group in the final UMAP, while cells
+            # with 5-7 of 15 (a majority cut) mostly stayed with their group. Agreement is a mean of booleans,
+            # so it equals a fraction such as 5/15 exactly; "fewer than" keeps a cell sitting at the cut.
+            group_agreement = agreement[finite_positions]
+            group_outlier = group_agreement < label_min_agreement
+            outlier[finite_positions] = group_outlier
+            method_used[finite_positions] = "neighbor_label"
+            score[finite_positions] = 1.0 - group_agreement
+            row.update(
+                {
+                    "method": "neighbor_label",
+                    "parameter": int(label_k),
+                    "n_outliers": int(group_outlier.sum() + outlier[invalid_positions].sum()),
+                }
+            )
         else:
             raise ValueError(f"Unexpected outlier method {chosen!r}.")
 
@@ -622,6 +722,8 @@ def detect_outliers(
         target.obs[f"{outlier_key}_score"] = expand(score, np.nan)
         if np.any(pd.notna(dbscan_label)):
             target.obs[f"{outlier_key}_dbscan_label"] = pd.array(expand(dbscan_label, pd.NA), dtype="Int64")
+        if method == "neighbor_label":
+            target.obs[f"{outlier_key}_neighbor_label"] = pd.Categorical(expand(neighbor_label, None))
 
         target.uns[diagnostics_key] = {
             "use_rep": use_rep,
@@ -638,6 +740,9 @@ def detect_outliers(
             "lof_n_neighbors_min": int(lof_n_neighbors_min),
             "lof_n_neighbors_max": int(lof_n_neighbors_max),
             "lof_contamination": lof_contamination,
+            "label_n_neighbors": int(label_n_neighbors),
+            "label_min_agreement": float(label_min_agreement),
+            "backend": backend,
             "metric": metric,
             "n_cells": int(adata.n_obs),
             "n_outliers": int(outlier.sum()),
